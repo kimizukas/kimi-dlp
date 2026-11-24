@@ -2,41 +2,38 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import re
 import time
 
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import (
+    parse_qs,
+    urlencode,
+    urlparse,
+    urlunparse,
+)
 
 import httpx
 
 
 _BASE = "https://www.youtube.com"
-_MUSIC = "https://music.youtube.com"
+_ANDROID_VERSION = "20.10.38"
+_WEB_VERSION = "2.20261123.00.00"
 
-_DEFAULT_API_KEY = (
-    "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-)
-
-_CLIENT_VERSION = "2.20261123.00.00"
+_DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_PLAYLIST_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
+
 _API_KEY_RE = re.compile(
     r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"'
 )
 _VERSION_RE = re.compile(
     r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"'
-)
-
-_PLAYER_RE = re.compile(
-    r"ytInitialPlayerResponse\s*=\s*({.*?})\s*;"
-)
-_DATA_RE = re.compile(
-    r"ytInitialData\s*=\s*({.*?})\s*;"
 )
 
 
@@ -49,7 +46,7 @@ class YouTubeUnavailable(YouTubeExtractorError):
 
 
 class YouTubeRestricted(YouTubeExtractorError):
-    """YouTube requires authentication or additional verification."""
+    """Authentication or verification is required."""
 
 
 class YouTubeRequestError(YouTubeExtractorError):
@@ -58,7 +55,6 @@ class YouTubeRequestError(YouTubeExtractorError):
 
 @dataclass(slots=True)
 class YouTubeOptions:
-    # Main data
     metadata: bool = True
     formats: bool = True
     thumbnails: bool = True
@@ -67,22 +63,18 @@ class YouTubeOptions:
     chapters: bool = True
     captions: bool = True
 
-    # Additional data
     automatic_captions: bool = False
     watch_playlist: bool = True
     related_videos: bool = False
     raw_response: bool = False
 
-    # Resource-heavy features
     comments: bool = False
     hls: bool = False
     dash: bool = False
 
-    # Playlist
     flat_playlist: bool = True
     playlist_limit: int = 100
 
-    # Request behaviour
     retries: int = 2
     timeout: float = 12.0
 
@@ -101,15 +93,16 @@ class CacheEntry:
 
 
 class TTLCache:
-    """Bounded LRU cache with TTL and request de-duplication."""
+    """Bounded LRU cache with TTL and concurrent request de-duplication."""
 
     def __init__(
         self,
         maxsize: int = 512,
         ttl: int = 21600,
     ):
-        self.maxsize = max(1, maxsize)
-        self.ttl = max(1, ttl)
+        self.maxsize = max(1, int(maxsize))
+        self.ttl = max(1, int(ttl))
+
         self._data: OrderedDict[str, CacheEntry] = OrderedDict()
         self._inflight: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
@@ -136,21 +129,49 @@ class TTLCache:
             self.hits += 1
             return item.value
 
-    async def put(self, key: str, value: Any, ttl: int | None = None):
+    async def put(
+        self,
+        key: str,
+        value: Any,
+        ttl: int | None = None,
+    ):
+        lifetime = self.ttl if ttl is None else max(1, int(ttl))
+
         async with self._lock:
             self._data[key] = CacheEntry(
                 value=value,
-                expires=time.monotonic() + (
-                    self.ttl if ttl is None else max(1, ttl)
-                ),
+                expires=time.monotonic() + lifetime,
             )
             self._data.move_to_end(key)
 
             while len(self._data) > self.maxsize:
                 self._data.popitem(last=False)
 
-    async def get_or_create(self, key: str, factory, ttl: int | None = None):
+    async def _produce(
+        self,
+        key: str,
+        factory,
+        ttl: int | None,
+    ):
+        try:
+            result = await factory()
+            await self.put(key, result, ttl)
+            return result
+        finally:
+            async with self._lock:
+                current = self._inflight.get(key)
+
+                if current is asyncio.current_task():
+                    self._inflight.pop(key, None)
+
+    async def get_or_create(
+        self,
+        key: str,
+        factory,
+        ttl: int | None = None,
+    ):
         cached = await self.get(key)
+
         if cached is not None:
             return cached
 
@@ -158,25 +179,13 @@ class TTLCache:
             task = self._inflight.get(key)
 
             if task is None:
-                task = asyncio.create_task(factory())
+                task = asyncio.create_task(
+                    self._produce(key, factory, ttl)
+                )
                 self._inflight[key] = task
-                creator = True
-            else:
-                creator = False
 
-        try:
-            result = await asyncio.shield(task)
-
-            if creator:
-                await self.put(key, result, ttl)
-
-            return result
-
-        finally:
-            if creator:
-                async with self._lock:
-                    if self._inflight.get(key) is task:
-                        self._inflight.pop(key, None)
+        # Cancellation of one caller must not cancel shared work.
+        return await asyncio.shield(task)
 
     async def clear(self):
         async with self._lock:
@@ -184,8 +193,13 @@ class TTLCache:
 
     async def stats(self):
         async with self._lock:
+            now = time.monotonic()
+
             return {
-                "entries": len(self._data),
+                "entries": sum(
+                    1 for item in self._data.values()
+                    if item.expires > now
+                ),
                 "inflight": len(self._inflight),
                 "hits": self.hits,
                 "misses": self.misses,
@@ -199,8 +213,12 @@ class YouTubeExtractor:
     """
     Lightweight asynchronous YouTube extractor.
 
-    Metadata and playlist cache: 6 hours.
+    Metadata cache: 6 hours.
+    Playlist cache: 6 hours.
     Stream URL cache: 5 minutes.
+
+    Android Innertube is preferred for player requests.
+    WEB is used as a fallback.
     """
 
     def __init__(
@@ -218,36 +236,42 @@ class YouTubeExtractor:
         self.api_key = api_key or _DEFAULT_API_KEY
         self._external_client = client is not None
 
-        self.client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
-            follow_redirects=True,
-            proxy=proxy,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            cookies=self._load_cookies(cookies),
-        )
+        if client is not None:
+            self.client = client
+        else:
+            self.client = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout),
+                follow_redirects=True,
+                proxy=proxy,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Linux; Android 15) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Mobile Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                cookies=self._load_cookies(cookies),
+            )
 
         self.metadata_cache = TTLCache(
             maxsize=cache_size,
             ttl=metadata_ttl,
         )
+
         self.playlist_cache = TTLCache(
             maxsize=max(32, cache_size // 4),
             ttl=metadata_ttl,
         )
+
         self.stream_cache = TTLCache(
             maxsize=cache_size,
             ttl=stream_ttl,
         )
 
         self._api_key = self.api_key
-        self._client_version = _CLIENT_VERSION
+        self._client_version = _WEB_VERSION
+
         self._bootstrap_lock = asyncio.Lock()
         self._bootstrapped = False
 
@@ -268,13 +292,22 @@ class YouTubeExtractor:
 
                     parts = line.split("\t")
 
-                    if len(parts) >= 7:
+                    if len(parts) < 7:
+                        continue
+
+                    domain = parts[0].lstrip("#")
+                    path = parts[2] or "/"
+                    name = parts[5]
+                    value = parts[6]
+
+                    if name:
                         cookies.set(
-                            parts[5],
-                            parts[6],
-                            domain=parts[0],
-                            path=parts[2],
+                            name,
+                            value,
+                            domain=domain,
+                            path=path,
                         )
+
         except OSError as exc:
             raise YouTubeExtractorError(
                 f"Unable to read cookie file: {exc}"
@@ -291,6 +324,23 @@ class YouTubeExtractor:
 
     async def __aexit__(self, *_):
         await self.close()
+
+    @staticmethod
+    def _retry_delay(response, attempt: int):
+        retry_after = response.headers.get("Retry-After")
+
+        if retry_after:
+            try:
+                return min(15.0, max(0.0, float(retry_after)))
+            except ValueError:
+                try:
+                    date = parsedate_to_datetime(retry_after)
+                    delay = date.timestamp() - time.time()
+                    return min(15.0, max(0.0, delay))
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
+        return min(0.4 * (2 ** attempt), 3.0)
 
     async def _request(
         self,
@@ -310,11 +360,16 @@ class YouTubeExtractor:
                     **kwargs,
                 )
 
-                if response.status_code in (429, 500, 502, 503, 504):
+                if response.status_code in (
+                    429, 500, 502, 503, 504
+                ):
                     if attempt < retries:
-                        await asyncio.sleep(
-                            min(0.4 * (2 ** attempt), 2.0)
+                        delay = self._retry_delay(
+                            response,
+                            attempt,
                         )
+                        await response.aclose()
+                        await asyncio.sleep(delay)
                         continue
 
                 if response.status_code in (401, 403):
@@ -326,9 +381,19 @@ class YouTubeExtractor:
                 response.raise_for_status()
                 return response
 
+            except YouTubeExtractorError:
+                raise
+
+            except httpx.HTTPStatusError as exc:
+                raise YouTubeRequestError(
+                    f"YouTube HTTP error: {exc.response.status_code}"
+                ) from exc
+
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 if attempt >= retries:
-                    raise YouTubeRequestError(str(exc)) from exc
+                    raise YouTubeRequestError(
+                        f"YouTube network error: {exc}"
+                    ) from exc
 
                 await asyncio.sleep(
                     min(0.3 * (2 ** attempt), 2.0)
@@ -362,33 +427,52 @@ class YouTubeExtractor:
                     self._client_version = version.group(1)
 
             except YouTubeExtractorError:
-                # Existing known client configuration remains fallback.
+                # Keep the known API key and client configuration.
                 pass
 
             self._bootstrapped = True
 
-    async def _player(self, video_id: str, options: YouTubeOptions):
-        await self._bootstrap()
+    @staticmethod
+    def _player_payload(
+        video_id: str,
+        client_name: str,
+        client_version: str,
+    ):
+        client = {
+            "clientName": client_name,
+            "clientVersion": client_version,
+            "hl": "en",
+            "gl": "US",
+        }
 
-        url = f"{_BASE}/youtubei/v1/player"
+        if client_name == "ANDROID":
+            client["androidSdkVersion"] = 35
 
-        payload = {
+        return {
             "videoId": video_id,
             "contentCheckOk": True,
             "racyCheckOk": True,
             "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": self._client_version,
-                    "hl": "en",
-                    "gl": "US",
-                }
+                "client": client,
             },
         }
 
+    async def _player_request(
+        self,
+        video_id: str,
+        options: YouTubeOptions,
+        client_name: str,
+        client_version: str,
+    ):
+        payload = self._player_payload(
+            video_id,
+            client_name,
+            client_version,
+        )
+
         response = await self._request(
             "POST",
-            url,
+            f"{_BASE}/youtubei/v1/player",
             options=options,
             params={"key": self._api_key},
             json=payload,
@@ -400,43 +484,200 @@ class YouTubeExtractor:
         )
 
         try:
-            return response.json()
+            data = response.json()
         except ValueError as exc:
             raise YouTubeRequestError(
                 "Invalid player response."
             ) from exc
 
+        if not isinstance(data, dict):
+            raise YouTubeRequestError(
+                "Unexpected player response."
+            )
+
+        return data
+
+    async def _player(
+        self,
+        video_id: str,
+        options: YouTubeOptions,
+    ):
+        await self._bootstrap()
+
+        android_error = None
+        android_data = None
+
+        try:
+            android_data = await self._player_request(
+                video_id,
+                options,
+                "ANDROID",
+                _ANDROID_VERSION,
+            )
+        except YouTubeExtractorError as exc:
+            android_error = exc
+
+        if isinstance(android_data, dict):
+            status = (
+                android_data.get("playabilityStatus") or {}
+            ).get("status")
+
+            streaming = android_data.get("streamingData") or {}
+            formats = (
+                streaming.get("formats") or []
+            ) + (
+                streaming.get("adaptiveFormats") or []
+            )
+
+            # Android response is useful even if streams are unavailable.
+            if status in (None, "OK") and formats:
+                return android_data
+
+            # Keep a successful metadata response as fallback.
+            if status in (None, "OK"):
+                try:
+                    web_data = await self._player_request(
+                        video_id,
+                        options,
+                        "WEB",
+                        self._client_version,
+                    )
+
+                    web_status = (
+                        web_data.get("playabilityStatus") or {}
+                    ).get("status")
+
+                    if web_status in (None, "OK"):
+                        web_streaming = (
+                            web_data.get("streamingData") or {}
+                        )
+                        web_formats = (
+                            web_streaming.get("formats") or []
+                        ) + (
+                            web_streaming.get("adaptiveFormats") or []
+                        )
+
+                        if web_formats:
+                            return web_data
+
+                except YouTubeExtractorError:
+                    pass
+
+                return android_data
+
+        # WEB fallback for failed Android requests/statuses.
+        try:
+            web_data = await self._player_request(
+                video_id,
+                options,
+                "WEB",
+                self._client_version,
+            )
+
+            web_status = (
+                web_data.get("playabilityStatus") or {}
+            ).get("status")
+
+            if web_status in (None, "OK"):
+                return web_data
+
+            if android_data is None:
+                return web_data
+
+        except YouTubeExtractorError:
+            if android_data is None:
+                if android_error:
+                    raise android_error
+                raise
+
+        if android_data is not None:
+            return android_data
+
+        raise YouTubeRequestError(
+            "Unable to obtain YouTube player response."
+        )
+
     @staticmethod
     def _video_id(value: str) -> str:
+        if not isinstance(value, str):
+            raise YouTubeExtractorError(
+                "Video ID or URL must be a string."
+            )
+
         value = value.strip()
 
         if _ID_RE.fullmatch(value):
             return value
 
-        parsed = urlparse(value)
-        host = parsed.netloc.lower()
+        try:
+            parsed = urlparse(value)
+        except ValueError as exc:
+            raise YouTubeExtractorError(
+                "Invalid YouTube URL."
+            ) from exc
 
-        if host.endswith("youtu.be"):
-            video_id = parsed.path.strip("/").split("/")[0]
+        host = (parsed.hostname or "").lower()
 
-        elif "youtube.com" in host:
-            query = parse_qs(parsed.query)
+        allowed_hosts = {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+            "youtu.be",
+            "www.youtube-nocookie.com",
+            "youtube-nocookie.com",
+        }
 
-            video_id = (
-                query.get("v", [None])[0]
-                or (
-                    parsed.path.split("/")[2]
-                    if parsed.path.startswith(("/shorts/", "/live/", "/embed/"))
-                    and len(parsed.path.split("/")) > 2
-                    else None
-                )
+        if host not in allowed_hosts:
+            raise YouTubeExtractorError(
+                "Invalid YouTube video URL or ID."
             )
 
-        else:
-            video_id = None
+        video_id = None
+
+        if host in ("youtu.be",):
+            video_id = parsed.path.strip("/").split("/")[0]
+
+        elif host in (
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "music.youtube.com",
+        ):
+            query = parse_qs(parsed.query)
+
+            video_id = query.get("v", [None])[0]
+
+            if not video_id:
+                parts = [
+                    part for part in parsed.path.split("/")
+                    if part
+                ]
+
+                if len(parts) >= 2 and parts[0] in (
+                    "shorts",
+                    "live",
+                    "embed",
+                    "v",
+                ):
+                    video_id = parts[1]
+
+        elif host in (
+            "youtube-nocookie.com",
+            "www.youtube-nocookie.com",
+        ):
+            parts = [
+                part for part in parsed.path.split("/")
+                if part
+            ]
+
+            if len(parts) >= 2 and parts[0] == "embed":
+                video_id = parts[1]
 
         if not video_id or not _ID_RE.fullmatch(video_id):
-            raise YouTubeExtractorError("Invalid YouTube video URL or ID.")
+            raise YouTubeExtractorError(
+                "Invalid YouTube video URL or ID."
+            )
 
         return video_id
 
@@ -448,8 +689,10 @@ class YouTubeExtractor:
         if not isinstance(value, dict):
             return None
 
-        if isinstance(value.get("simpleText"), str):
-            return value["simpleText"]
+        simple = value.get("simpleText")
+
+        if isinstance(simple, str):
+            return simple or None
 
         runs = value.get("runs")
 
@@ -458,6 +701,7 @@ class YouTubeExtractor:
                 item.get("text", "")
                 for item in runs
                 if isinstance(item, dict)
+                and isinstance(item.get("text", ""), str)
             ).strip()
 
             return result or None
@@ -473,16 +717,16 @@ class YouTubeExtractor:
 
             if isinstance(item, dict):
                 yield item
-                stack.extend(item.values())
+                stack.extend(reversed(tuple(item.values())))
 
             elif isinstance(item, list):
-                stack.extend(item)
+                stack.extend(reversed(item))
 
     @staticmethod
     def _duration(value: Any):
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return None
 
     @staticmethod
@@ -490,53 +734,204 @@ class YouTubeExtractor:
         if not isinstance(data, list):
             return []
 
-        return [
-            {
-                "url": item["url"],
+        output = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            url = item.get("url")
+
+            if not isinstance(url, str):
+                continue
+
+            output.append({
+                "url": url,
                 "width": item.get("width"),
                 "height": item.get("height"),
-            }
-            for item in data
-            if isinstance(item, dict)
-            and isinstance(item.get("url"), str)
+            })
+
+        return output
+
+    @staticmethod
+    def _format_flags(item: dict):
+        mime = item.get("mimeType") or ""
+        mime_lower = mime.lower()
+
+        codecs_match = re.search(
+            r'codecs="([^"]+)"',
+            mime,
+            re.IGNORECASE,
+        )
+
+        codecs = (
+            codecs_match.group(1)
+            if codecs_match
+            else None
+        )
+
+        codec_list = [
+            codec.strip().lower()
+            for codec in (codecs or "").split(",")
+            if codec.strip()
         ]
+
+        audio_codec = any(
+            codec.startswith((
+                "mp4a",
+                "opus",
+                "vorbis",
+                "aac",
+                "ac-3",
+                "ec-3",
+                "alac",
+                "flac",
+            ))
+            for codec in codec_list
+        )
+
+        video_codec = any(
+            codec.startswith((
+                "avc",
+                "av01",
+                "vp8",
+                "vp9",
+                "vp09",
+                "hev",
+                "hvc",
+            ))
+            for codec in codec_list
+        )
+
+        has_audio = (
+            mime_lower.startswith("audio/")
+            or audio_codec
+            or item.get("audioQuality") is not None
+            or item.get("audioChannels") is not None
+        )
+
+        has_video = (
+            mime_lower.startswith("video/")
+            or video_codec
+            or item.get("width") is not None
+            or item.get("height") is not None
+        )
+
+        return has_audio, has_video, codecs
 
     @staticmethod
     def _formats(player: dict):
         streaming = player.get("streamingData") or {}
 
-        output = []
+        if not isinstance(streaming, dict):
+            return []
 
-        for item in (
-            streaming.get("formats", [])
-            + streaming.get("adaptiveFormats", [])
-        ):
+        regular = streaming.get("formats") or []
+        adaptive = streaming.get("adaptiveFormats") or []
+
+        if not isinstance(regular, list):
+            regular = []
+
+        if not isinstance(adaptive, list):
+            adaptive = []
+
+        output = []
+        seen = set()
+
+        for item in regular + adaptive:
             if not isinstance(item, dict):
                 continue
 
-            cipher = item.get("signatureCipher") or item.get("cipher")
+            itag = item.get("itag")
+            mime = item.get("mimeType") or ""
+
+            cipher = (
+                item.get("signatureCipher")
+                or item.get("cipher")
+            )
+
             direct_url = item.get("url")
             cipher_data = {}
 
             if isinstance(cipher, str):
                 cipher_data = {
                     key: values[0]
-                    for key, values in parse_qs(cipher).items()
+                    for key, values in parse_qs(
+                        cipher,
+                        keep_blank_values=True,
+                    ).items()
                     if values
                 }
 
-                # Encrypted signatures must not be treated as direct URLs.
+                cipher_url = cipher_data.get("url")
+
+                if cipher_url and not direct_url:
+                    direct_url = cipher_url
+
+                # A plain signature can be appended without deciphering.
+                plain_signature = (
+                    cipher_data.get("sig")
+                    or cipher_data.get("signature")
+                )
+
+                if direct_url and plain_signature:
+                    parsed = urlparse(direct_url)
+                    query = parse_qs(
+                        parsed.query,
+                        keep_blank_values=True,
+                    )
+
+                    signature_name = (
+                        cipher_data.get("sp") or "signature"
+                    )
+
+                    query[signature_name] = [plain_signature]
+
+                    direct_url = urlunparse(
+                        parsed._replace(
+                            query=urlencode(query, doseq=True)
+                        )
+                    )
+
+                # Encrypted signature requires JavaScript deciphering.
                 if cipher_data.get("s"):
                     direct_url = None
-                else:
-                    direct_url = cipher_data.get("url") or direct_url
 
-            parsed_url = urlparse(direct_url) if direct_url else None
-            query = parse_qs(parsed_url.query) if parsed_url else {}
+            parsed_url = (
+                urlparse(direct_url)
+                if isinstance(direct_url, str)
+                else None
+            )
+
+            query = (
+                parse_qs(parsed_url.query)
+                if parsed_url
+                else {}
+            )
+
+            has_audio, has_video, codecs = (
+                YouTubeExtractor._format_flags(item)
+            )
+
+            requires_n = bool(query.get("n"))
+            requires_signature = bool(cipher_data.get("s"))
+
+            # Avoid duplicate format entries.
+            unique_key = (
+                itag,
+                mime,
+                item.get("qualityLabel"),
+                item.get("bitrate"),
+            )
+
+            if unique_key in seen:
+                continue
+
+            seen.add(unique_key)
 
             output.append({
-                "itag": item.get("itag"),
-                "mime_type": item.get("mimeType"),
+                "itag": itag,
+                "mime_type": mime or None,
                 "quality": item.get("quality"),
                 "quality_label": item.get("qualityLabel"),
                 "width": item.get("width"),
@@ -551,30 +946,50 @@ class YouTubeExtractor:
                 "approximate_content_length": item.get(
                     "approximateContentLength"
                 ),
-                "codecs": (
-                    item.get("mimeType", "").split("codecs=")[-1]
-                    .strip('"')
-                    if "codecs=" in item.get("mimeType", "")
-                    else None
-                ),
-                "has_audio": item.get("audioQuality") is not None
-                    or item.get("audioChannels") is not None,
-                "has_video": item.get("width") is not None,
+                "codecs": codecs,
+                "has_audio": has_audio,
+                "has_video": has_video,
                 "url": direct_url,
-                "requires_signature": bool(cipher_data.get("s")),
-                "requires_n_transform": bool(query.get("n")),
-                "signature_cipher": cipher if cipher_data.get("s") else None,
+                "is_direct": bool(
+                    direct_url
+                    and not requires_signature
+                    and not requires_n
+                ),
+                "requires_signature": requires_signature,
+                "requires_n_transform": requires_n,
+                "signature_cipher": (
+                    cipher if requires_signature else None
+                ),
             })
+
+        # Prefer combined audio/video formats, then higher quality.
+        output.sort(
+            key=lambda item: (
+                bool(item["has_audio"] and item["has_video"]),
+                bool(item["is_direct"]),
+                item.get("height") or 0,
+                item.get("bitrate") or 0,
+            ),
+            reverse=True,
+        )
 
         return output
 
     @staticmethod
     def _captions(player: dict, automatic: bool):
-        tracks = (
-            player.get("captions", {})
-            .get("playerCaptionsTracklistRenderer", {})
-            .get("captionTracks", [])
-        )
+        captions_data = player.get("captions") or {}
+
+        if not isinstance(captions_data, dict):
+            return []
+
+        renderer = captions_data.get(
+            "playerCaptionsTracklistRenderer"
+        ) or {}
+
+        tracks = renderer.get("captionTracks") or []
+
+        if not isinstance(tracks, list):
+            return []
 
         output = []
 
@@ -582,14 +997,16 @@ class YouTubeExtractor:
             if not isinstance(item, dict):
                 continue
 
-            is_auto = bool(item.get("kind") == "asr")
+            is_auto = item.get("kind") == "asr"
 
             if is_auto and not automatic:
                 continue
 
             output.append({
                 "language": item.get("languageCode"),
-                "name": YouTubeExtractor._text(item.get("name")),
+                "name": YouTubeExtractor._text(
+                    item.get("name")
+                ),
                 "url": item.get("baseUrl"),
                 "automatic": is_auto,
                 "vss_id": item.get("vssId"),
@@ -605,19 +1022,42 @@ class YouTubeExtractor:
     ):
         details = player.get("videoDetails") or {}
         status = player.get("playabilityStatus") or {}
-        micro = player.get("microformat", {}).get(
-            "playerMicroformatRenderer", {}
-        )
 
-        if status.get("status") not in (None, "OK"):
-            reason = status.get("reason") or status.get("status")
+        microformat = player.get("microformat") or {}
+        micro = microformat.get(
+            "playerMicroformatRenderer"
+        ) or {}
 
-            if status.get("status") in (
+        if not isinstance(details, dict):
+            details = {}
+
+        if not isinstance(status, dict):
+            status = {}
+
+        status_code = status.get("status")
+
+        if status_code not in (None, "OK"):
+            reason = (
+                status.get("reason")
+                or status_code
+                or "Video unavailable."
+            )
+
+            if status_code in (
                 "LOGIN_REQUIRED",
                 "AGE_CHECK_REQUIRED",
                 "CONTENT_CHECK_REQUIRED",
+                "AGE_VERIFICATION_REQUIRED",
             ):
                 raise YouTubeRestricted(str(reason))
+
+            if status_code in (
+                "ERROR",
+                "UNPLAYABLE",
+                "LIVE_STREAM_OFFLINE",
+                "UNAVAILABLE",
+            ):
+                raise YouTubeUnavailable(str(reason))
 
             raise YouTubeUnavailable(str(reason))
 
@@ -646,27 +1086,31 @@ class YouTubeExtractor:
                 if options.description else None
             ),
             "tags": (
-                details.get("keywords", [])
+                details.get("keywords") or []
                 if options.tags else []
             ),
             "thumbnails": (
                 YouTubeExtractor._thumbnails(
-                    details.get("thumbnail", {}).get("thumbnails")
+                    (details.get("thumbnail") or {}).get(
+                        "thumbnails"
+                    )
                 )
                 if options.thumbnails else []
             ),
-            "formats": [],
+            "formats": (
+                YouTubeExtractor._formats(player)
+                if options.formats else []
+            ),
             "captions": [],
             "automatic_captions": [],
             "chapters": [],
             "related_videos": [],
             "playlist": None,
-            "playability_status": status.get("status"),
+            "playability_status": status_code,
             "playability_reason": status.get("reason"),
+            "hls_manifest_url": None,
+            "dash_manifest_url": None,
         }
-
-        if options.formats:
-            result["formats"] = YouTubeExtractor._formats(player)
 
         if options.captions:
             captions = YouTubeExtractor._captions(
@@ -675,12 +1119,14 @@ class YouTubeExtractor:
             )
 
             result["captions"] = [
-                item for item in captions if not item["automatic"]
+                item for item in captions
+                if not item["automatic"]
             ]
 
             if options.automatic_captions:
                 result["automatic_captions"] = [
-                    item for item in captions if item["automatic"]
+                    item for item in captions
+                    if item["automatic"]
                 ]
 
         if options.chapters:
@@ -688,8 +1134,67 @@ class YouTubeExtractor:
                 micro.get("chapters") or []
             )
 
+        streaming = player.get("streamingData") or {}
+
+        if options.hls:
+            result["hls_manifest_url"] = streaming.get(
+                "hlsManifestUrl"
+            )
+
+        if options.dash:
+            result["dash_manifest_url"] = streaming.get(
+                "dashManifestUrl"
+            )
+
         if options.raw_response:
             result["raw_response"] = player
+
+        return result
+
+    @staticmethod
+    def _copy_result(value: dict):
+        # The normalized result contains JSON-compatible data.
+        return json.loads(json.dumps(value))
+
+    @staticmethod
+    def _full_options(options: YouTubeOptions):
+        return YouTubeOptions(
+            metadata=True,
+            formats=True,
+            thumbnails=True,
+            description=True,
+            tags=True,
+            chapters=True,
+            captions=True,
+            automatic_captions=True,
+            watch_playlist=options.watch_playlist,
+            related_videos=options.related_videos,
+            raw_response=False,
+            comments=options.comments,
+            hls=options.hls,
+            dash=options.dash,
+            flat_playlist=options.flat_playlist,
+            playlist_limit=options.playlist_limit,
+            retries=options.retries,
+            timeout=options.timeout,
+        )
+
+    async def _fetch_video(self, video_id: str, options: YouTubeOptions):
+        player = await self._player(video_id, options)
+
+        full_options = self._full_options(options)
+
+        result = self._parse_player(
+            video_id,
+            player,
+            full_options,
+        )
+
+        # Store stream URLs from the same player response.
+        await self.stream_cache.put(
+            f"streams:{video_id}",
+            result["formats"],
+        )
 
         return result
 
@@ -704,34 +1209,54 @@ class YouTubeExtractor:
         options = options or YouTubeOptions()
         video_id = self._video_id(value)
 
-        # Keep cache keys independent of caller-specific settings.
         cache_key = f"video:{video_id}"
 
         async def fetch():
-            player = await self._player(video_id, options)
-
-            return self._parse_player(
+            return await self._fetch_video(
                 video_id,
-                player,
                 options,
             )
 
         if refresh:
             result = await fetch()
             await self.metadata_cache.put(cache_key, result)
-            return result
+        else:
+            result = await self.metadata_cache.get_or_create(
+                cache_key,
+                fetch,
+            )
 
-        result = await self.metadata_cache.get_or_create(
-            cache_key,
-            fetch,
-        )
+        result = self._copy_result(result)
 
-        # Do not mutate the shared cached object.
-        result = json.loads(json.dumps(result))
+        if not options.metadata:
+            # Preserve the stable output structure.
+            result["title"] = None
+            result["author"] = None
+            result["channel_id"] = None
+            result["duration"] = None
+            result["view_count"] = None
 
-        # Options control returned fields too.
         if not options.formats:
             result["formats"] = []
+        else:
+            stream_key = f"streams:{video_id}"
+
+            streams = await self.stream_cache.get(stream_key)
+
+            if streams is None:
+                async def fetch_streams():
+                    player = await self._player(
+                        video_id,
+                        options,
+                    )
+                    return self._formats(player)
+
+                streams = await self.stream_cache.get_or_create(
+                    stream_key,
+                    fetch_streams,
+                )
+
+            result["formats"] = self._copy_result(streams)
 
         if not options.thumbnails:
             result["thumbnails"] = []
@@ -746,32 +1271,83 @@ class YouTubeExtractor:
             result["captions"] = []
             result["automatic_captions"] = []
 
-        if not options.automatic_captions:
+        elif not options.automatic_captions:
             result["automatic_captions"] = []
 
         if not options.chapters:
             result["chapters"] = []
 
-        if options.raw_response is False:
+        if not options.hls:
+            result["hls_manifest_url"] = None
+
+        if not options.dash:
+            result["dash_manifest_url"] = None
+
+        if options.raw_response:
+            # Raw responses are intentionally not kept in the long cache.
+            player = await self._player(video_id, options)
+            result["raw_response"] = player
+        else:
             result.pop("raw_response", None)
 
-        # Stream URLs have their own short cache.
-        if options.formats:
-            stream_key = f"streams:{video_id}"
-
-            async def fetch_streams():
-                player = await self._player(video_id, options)
-                return self._formats(player)
-
-            streams = await self.stream_cache.get_or_create(
-                stream_key,
-                fetch_streams,
-                ttl=300,
-            )
-
-            result["formats"] = streams
-
         return result
+
+    @staticmethod
+    def _extract_json_assignment(page: str, variable: str):
+        """
+        Extract a JSON object assigned to a JavaScript variable.
+        Handles nested objects, braces inside strings and escaped quotes.
+        """
+        if not isinstance(page, str):
+            return None
+
+        pattern = re.compile(
+            rf"(?:var\s+|let\s+|const\s+)?{re.escape(variable)}\s*="
+        )
+
+        match = pattern.search(page)
+
+        if not match:
+            return None
+
+        start = page.find("{", match.end())
+
+        if start < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+
+        for index in range(start, len(page)):
+            char = page[index]
+
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+
+                if depth == 0:
+                    raw = page[start:index + 1]
+
+                    try:
+                        return json.loads(raw)
+                    except ValueError:
+                        return None
+
+        return None
 
     @staticmethod
     def _playlist_items(data: Any):
@@ -789,10 +1365,11 @@ class YouTubeExtractor:
 
             video_id = renderer.get("videoId")
 
-            if not isinstance(video_id, str) or not _ID_RE.fullmatch(video_id):
-                continue
-
-            if video_id in seen:
+            if (
+                not isinstance(video_id, str)
+                or not _ID_RE.fullmatch(video_id)
+                or video_id in seen
+            ):
                 continue
 
             seen.add(video_id)
@@ -804,7 +1381,9 @@ class YouTubeExtractor:
                 ),
                 "url": f"{_BASE}/watch?v={video_id}",
                 "thumbnail": YouTubeExtractor._thumbnails(
-                    renderer.get("thumbnail", {}).get("thumbnails")
+                    (renderer.get("thumbnail") or {}).get(
+                        "thumbnails"
+                    )
                 ),
                 "duration": YouTubeExtractor._text(
                     renderer.get("lengthText")
@@ -825,106 +1404,60 @@ class YouTubeExtractor:
         for node in YouTubeExtractor._walk(data):
             endpoint = node.get("continuationEndpoint")
 
-            if not isinstance(endpoint, dict):
-                continue
+            if isinstance(endpoint, dict):
+                command = endpoint.get(
+                    "continuationCommand"
+                ) or {}
 
-            token = (
-                endpoint.get("continuationCommand", {})
-                .get("token")
+                token = command.get("token")
+
+                if token:
+                    return token
+
+            continuation_item = node.get(
+                "continuationItemRenderer"
             )
 
-            if token:
-                return token
+            if isinstance(continuation_item, dict):
+                endpoint = (
+                    continuation_item.get("continuationEndpoint")
+                    or {}
+                )
+
+                command = endpoint.get(
+                    "continuationCommand"
+                ) or {}
+
+                token = command.get("token")
+
+                if token:
+                    return token
 
         return None
 
-    async def get_playlist(
-        self,
-        playlist_id: str,
-        *,
-        limit: int = 100,
-        flat: bool = True,
-        options: YouTubeOptions | None = None,
-        refresh: bool = False,
-    ):
-        options = options or YouTubeOptions()
-        limit = max(1, min(int(limit), options.playlist_limit))
-
-        if not playlist_id:
-            raise YouTubeExtractorError("Playlist ID is required.")
-
-        cache_key = f"playlist:{playlist_id}:{limit}:{flat}"
-
-        async def fetch():
-            url = f"{_BASE}/playlist"
-            response = await self._request(
-                "GET",
-                url,
-                options=options,
-                params={"list": playlist_id},
+    @staticmethod
+    def _playlist_metadata(data: Any):
+        for node in YouTubeExtractor._walk(data):
+            renderer = node.get(
+                "playlistMetadataRenderer"
             )
 
-            page = response.text
-            match = _DATA_RE.search(page)
+            if isinstance(renderer, dict):
+                return {
+                    "title": renderer.get("title"),
+                    "description": renderer.get("description"),
+                }
 
-            if not match:
-                raise YouTubeRequestError(
-                    "Could not find playlist data in YouTube response."
-                )
+        return {
+            "title": None,
+            "description": None,
+        }
 
-            try:
-                data = json.loads(match.group(1))
-            except ValueError as exc:
-                raise YouTubeRequestError(
-                    "Invalid playlist response."
-                ) from exc
-
-            metadata = {}
-            for node in self._walk(data):
-                renderer = node.get("playlistMetadataRenderer")
-                if isinstance(renderer, dict):
-                    metadata = renderer
-                    break
-
-            items = self._playlist_items(data)
-            token = self._continuation(data)
-
-            # Flat mode intentionally avoids fetching every video.
-            return {
-                "id": playlist_id,
-                "title": metadata.get("title"),
-                "description": metadata.get("description"),
-                "url": f"{_BASE}/playlist?list={playlist_id}",
-                "video_count": metadata.get("videoCount"),
-                "items": items[:limit],
-                "continuation": token if len(items) < limit else None,
-                "has_more": bool(token and len(items) < limit),
-                "flat": flat,
-            }
-
-        if refresh:
-            result = await fetch()
-            await self.playlist_cache.put(cache_key, result)
-            return result
-
-        result = await self.playlist_cache.get_or_create(
-            cache_key,
-            fetch,
-        )
-
-        return json.loads(json.dumps(result))
-
-    async def get_playlist_next(
+    async def _browse_continuation(
         self,
-        playlist_id: str,
         continuation: str,
-        *,
-        limit: int = 100,
-        options: YouTubeOptions | None = None,
+        options: YouTubeOptions,
     ):
-        options = options or YouTubeOptions()
-        limit = max(1, min(int(limit), options.playlist_limit))
-
         await self._bootstrap()
 
         payload = {
@@ -945,6 +1478,11 @@ class YouTubeExtractor:
             options=options,
             params={"key": self._api_key},
             json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": _BASE,
+                "Referer": f"{_BASE}/",
+            },
         )
 
         try:
@@ -953,6 +1491,147 @@ class YouTubeExtractor:
             raise YouTubeRequestError(
                 "Invalid playlist continuation response."
             ) from exc
+
+        if not isinstance(data, dict):
+            raise YouTubeRequestError(
+                "Unexpected playlist continuation response."
+            )
+
+        return data
+
+    async def get_playlist(
+        self,
+        playlist_id: str,
+        *,
+        limit: int = 100,
+        flat: bool = True,
+        options: YouTubeOptions | None = None,
+        refresh: bool = False,
+    ):
+        options = options or YouTubeOptions()
+
+        if (
+            not isinstance(playlist_id, str)
+            or not _PLAYLIST_RE.fullmatch(playlist_id)
+        ):
+            raise YouTubeExtractorError(
+                "Invalid YouTube playlist ID."
+            )
+
+        limit = max(
+            1,
+            min(int(limit), options.playlist_limit, 500),
+        )
+
+        cache_key = (
+            f"playlist:{playlist_id}:{limit}:{bool(flat)}"
+        )
+
+        async def fetch():
+            response = await self._request(
+                "GET",
+                f"{_BASE}/playlist",
+                options=options,
+                params={"list": playlist_id},
+            )
+
+            data = self._extract_json_assignment(
+                response.text,
+                "ytInitialData",
+            )
+
+            if not isinstance(data, dict):
+                raise YouTubeRequestError(
+                    "Could not parse YouTube playlist page."
+                )
+
+            metadata = self._playlist_metadata(data)
+            items = self._playlist_items(data)
+            token = self._continuation(data)
+
+            # Fetch more pages only when needed.
+            pages = 0
+
+            while token and len(items) < limit and pages < 20:
+                pages += 1
+
+                next_data = await self._browse_continuation(
+                    token,
+                    options,
+                )
+
+                next_items = self._playlist_items(next_data)
+                known = {item["id"] for item in items}
+
+                for item in next_items:
+                    if item["id"] not in known:
+                        items.append(item)
+                        known.add(item["id"])
+
+                        if len(items) >= limit:
+                            break
+
+                token = self._continuation(next_data)
+
+                if not next_items:
+                    break
+
+            return {
+                "id": playlist_id,
+                "title": metadata["title"],
+                "description": metadata["description"],
+                "url": f"{_BASE}/playlist?list={playlist_id}",
+                "video_count": None,
+                "items": items[:limit],
+                "continuation": token,
+                "has_more": bool(token),
+                "flat": bool(flat),
+            }
+
+        if refresh:
+            result = await fetch()
+            await self.playlist_cache.put(cache_key, result)
+            return result
+
+        result = await self.playlist_cache.get_or_create(
+            cache_key,
+            fetch,
+        )
+
+        return self._copy_result(result)
+
+    async def get_playlist_next(
+        self,
+        playlist_id: str,
+        continuation: str,
+        *,
+        limit: int = 100,
+        options: YouTubeOptions | None = None,
+    ):
+        options = options or YouTubeOptions()
+
+        if (
+            not isinstance(playlist_id, str)
+            or not _PLAYLIST_RE.fullmatch(playlist_id)
+        ):
+            raise YouTubeExtractorError(
+                "Invalid YouTube playlist ID."
+            )
+
+        if not isinstance(continuation, str) or not continuation:
+            raise YouTubeExtractorError(
+                "A valid continuation token is required."
+            )
+
+        limit = max(
+            1,
+            min(int(limit), options.playlist_limit, 500),
+        )
+
+        data = await self._browse_continuation(
+            continuation,
+            options,
+        )
 
         items = self._playlist_items(data)
         next_token = self._continuation(data)
@@ -977,10 +1656,6 @@ class YouTubeExtractor:
             self.playlist_cache.clear(),
             self.stream_cache.clear(),
         )
-
-
-
-
 
 
 __all__ = [
