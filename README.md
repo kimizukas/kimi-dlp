@@ -1,1 +1,1 @@
-# kimi_dlp
+# kimi-dlp
