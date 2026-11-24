@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import copy
+import json
+import math
 import random
 import re
 import time
@@ -14,13 +15,33 @@ from typing import Any
 
 import httpx
 
+try:
+    import orjson
+    _loads = orjson.loads
+except ImportError:
+    _loads = json.loads
+
+try:
+    import h2  # noqa: F401
+    _HTTP2 = True
+except ImportError:
+    _HTTP2 = False
+
 
 class YouTubeSearchError(Exception):
     """YouTube search request or response error."""
 
 
+class _HttpStatusError(YouTubeSearchError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
 _BASE = "https://www.youtube.com"
 _MUSIC = "https://music.youtube.com"
+_SUGGEST_URL = "https://suggestqueries.google.com/complete/search"
+_DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
 _FILTERS: dict[str, tuple[str | None, str]] = {
     "all": (None, "web"),
@@ -35,32 +56,36 @@ _FILTERS: dict[str, tuple[str | None, str]] = {
 }
 
 _CLIENTS = {
-    "web": {
-        "name": "WEB",
-        "id": "1",
-        "version": "2.20261123.00.00",
-        "url": _BASE,
-    },
-    "music": {
-        "name": "WEB_REMIX",
-        "id": "67",
-        "version": "1.20260707.12.00",
-        "url": _MUSIC,
-    },
+    "web": {"name": "WEB", "id": "1", "version": "2.20261123.00.00", "url": _BASE},
+    "music": {"name": "WEB_REMIX", "id": "67", "version": "1.20260707.12.00", "url": _MUSIC},
 }
 
 _RE_API_KEY = re.compile(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"')
 _RE_VERSION = re.compile(r'"INNERTUBE_(?:CONTEXT_)?CLIENT_VERSION"\s*:\s*"([^"]+)"')
 _RE_VISITOR = re.compile(r'"(?:VISITOR_DATA|visitorData)"\s*:\s*"([^"]+)"')
+_RE_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 _DURATION_RE = re.compile(r"^\d+(?::\d{2}){1,2}$")
 _NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([kmb])?(?![a-z])", re.I)
 _VIEWS_RE = re.compile(r"\b(?:views?|plays?)\b", re.I)
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _CURSOR_PREFIX = "yts:"
+
 _STOP_WORDS = frozenset({
     "official", "video", "audio", "lyrics", "lyrical", "song", "songs",
-    "music", "hd", "4k", "remix", "status", "full", "video", "visualizer",
+    "music", "hd", "4k", "remix", "status", "full", "visualizer",
 })
+_PENALTY_WORDS = frozenset({
+    "live", "cover", "karaoke", "slowed", "reverb", "sped", "nightcore",
+    "8d", "instrumental", "mashup", "reprise", "acoustic", "lofi",
+    "remix", "edit", "tribute", "parody", "reaction", "tutorial", "trailer",
+})
+# Do not skip menu/overlay: Music result IDs can be nested there.
+_SKIP_KEYS = frozenset({
+    "trackingParams", "clickTrackingParams", "accessibility",
+    "accessibilityData", "serviceEndpoints", "loggingDirectives",
+    "responseContext", "frameworkUpdates", "topbar", "background",
+})
+_CORRECTION_KEYS = frozenset({"showingResultsForRenderer", "didYouMeanRenderer"})
 
 
 def _dig(data: Any, *path: str | int) -> Any:
@@ -82,17 +107,15 @@ def _text(value: Any) -> str | None:
     if not isinstance(value, dict):
         return None
     for key in ("simpleText", "content"):
-        result = value.get(key)
-        if isinstance(result, str) and result:
-            return result
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            return item
     runs = value.get("runs")
     if isinstance(runs, list):
-        parts = [
-            item.get("text", "")
-            for item in runs
+        result = "".join(
+            item.get("text", "") for item in runs
             if isinstance(item, dict) and isinstance(item.get("text"), str)
-        ]
-        result = "".join(parts).strip()
+        ).strip()
         return result or None
     return None
 
@@ -118,9 +141,7 @@ def _duration(value: str | None) -> int | None:
     if not _DURATION_RE.fullmatch(value):
         return None
     parts = [int(part) for part in value.split(":")]
-    if len(parts) == 2 and parts[1] >= 60:
-        return None
-    if len(parts) == 3 and (parts[1] >= 60 or parts[2] >= 60):
+    if any(part >= 60 for part in parts[1:]):
         return None
     total = 0
     for part in parts:
@@ -148,56 +169,63 @@ def _pick_thumbnail(thumbs: Any) -> str | None:
 
 
 def _thumbnail(renderer: dict) -> str | None:
-    candidates = (
-        _dig(renderer, "thumbnail", "thumbnails"),
-        _dig(renderer, "thumbnail", "musicThumbnailRenderer", "thumbnail", "thumbnails"),
-        _dig(renderer, "thumbnails", 0, "thumbnails"),
-        _dig(renderer, "thumbnailRenderer", "playlistVideoThumbnailRenderer", "thumbnail", "thumbnails"),
-        _dig(renderer, "thumbnailRenderer", "playlistCustomThumbnailRenderer", "thumbnail", "thumbnails"),
-        _dig(renderer, "thumbnail", "musicThumbnailRenderer", "thumbnail", "thumbnails"),
+    paths = (
+        ("thumbnail", "thumbnails"),
+        ("thumbnail", "musicThumbnailRenderer", "thumbnail", "thumbnails"),
+        ("thumbnails", 0, "thumbnails"),
+        ("thumbnailRenderer", "playlistVideoThumbnailRenderer", "thumbnail", "thumbnails"),
+        ("thumbnailRenderer", "playlistCustomThumbnailRenderer", "thumbnail", "thumbnails"),
     )
-    for thumbs in candidates:
-        result = _pick_thumbnail(thumbs)
+    for path in paths:
+        result = _pick_thumbnail(_dig(renderer, *path))
         if result:
             return result
     return None
 
 
 def _badges(renderer: dict) -> list[str]:
-    result = []
+    output = []
     for badge in renderer.get("badges") or []:
         meta = _dig(badge, "metadataBadgeRenderer")
         if not isinstance(meta, dict):
             continue
         label = meta.get("label") or _dig(meta, "accessibilityData", "label") or meta.get("tooltip")
         if isinstance(label, str) and label:
-            result.append(label)
-    return result
+            output.append(label)
+    return output
 
 
 def _is_verified(renderer: dict) -> bool:
     for key in ("ownerBadges", "badges"):
         for badge in renderer.get(key) or []:
             meta = _dig(badge, "metadataBadgeRenderer")
-            if not isinstance(meta, dict):
-                continue
-            blob = " ".join(str(meta.get(k, "")) for k in ("style", "tooltip", "label")).casefold()
-            if "verified" in blob or "official artist" in blob or "official_artist" in blob:
-                return True
+            if isinstance(meta, dict):
+                blob = " ".join(str(meta.get(k, "")) for k in ("style", "tooltip", "label")).casefold()
+                if "verified" in blob or "official artist" in blob or "official_artist" in blob:
+                    return True
     return False
 
 
+def _walk(data: Any) -> Iterator[dict]:
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            yield node
+            stack.extend(v for v in reversed(tuple(node.values())) if isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(v for v in reversed(node) if isinstance(v, (dict, list)))
+
+
 def _endpoint_video_id(value: Any) -> str | None:
-    """Find a watch/video endpoint in a bounded renderer subtree."""
     for node in _walk(value):
         for path in (
             ("watchEndpoint", "videoId"),
-            ("watchEndpoint", "video_id"),
             ("reelWatchEndpoint", "videoId"),
-            ("watchEndpointMusicSupportedConfigs", "watchEndpointMusicConfig", "musicVideoType"),
+            ("watchEndpoint", "video_id"),
         ):
             candidate = _dig(node, *path)
-            if isinstance(candidate, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+            if isinstance(candidate, str) and _RE_ID.fullmatch(candidate):
                 return candidate
     return None
 
@@ -213,29 +241,27 @@ def _channel_info(renderer: dict) -> dict:
         if isinstance(browse, dict):
             channel_id = channel_id or browse.get("browseId")
             path = path or browse.get("canonicalBaseUrl")
-        run_text = run.get("text") or ""
-        if run_text.startswith("@"):
-            handle = handle or run_text
+        name = run.get("text") or ""
+        if name.startswith("@"):
+            handle = handle or name
     if path and path.startswith("/@"):
         handle = handle or path[1:]
     if not path and channel_id:
         path = f"/channel/{channel_id}"
     return {
-        "channel_name": _text(owner),
-        "channel_id": channel_id,
+        "channel_name": _text(owner), "channel_id": channel_id,
         "channel_url": _BASE + path if path and path.startswith("/") else None,
-        "channel_handle": handle,
-        "channel_verified": _is_verified(renderer),
+        "channel_handle": handle, "channel_verified": _is_verified(renderer),
     }
 
 
 def _video(renderer: dict, source: str = "youtube") -> dict | None:
     video_id = renderer.get("videoId")
-    if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+    if not isinstance(video_id, str) or not _RE_ID.fullmatch(video_id):
         return None
     status = {}
-    for item in renderer.get("thumbnailOverlays") or []:
-        candidate = item.get("thumbnailOverlayTimeStatusRenderer") if isinstance(item, dict) else None
+    for entry in renderer.get("thumbnailOverlays") or []:
+        candidate = entry.get("thumbnailOverlayTimeStatusRenderer") if isinstance(entry, dict) else None
         if isinstance(candidate, dict):
             status = candidate
             break
@@ -244,13 +270,14 @@ def _video(renderer: dict, source: str = "youtube") -> dict | None:
     if duration_text and not _DURATION_RE.fullmatch(duration_text.strip()):
         duration_text = None
     view_text = _text(renderer.get("viewCountText")) or _text(renderer.get("shortViewCountText"))
-    description = _text(renderer.get("descriptionSnippet")) or _text(_dig(renderer, "detailedMetadataSnippets", 0, "snippetText"))
+    description = (
+        _text(renderer.get("descriptionSnippet"))
+        or _text(_dig(renderer, "detailedMetadataSnippets", 0, "snippetText"))
+    )
     badges = _badges(renderer)
-    labels = {item.strip().casefold() for item in badges}
+    labels = {label.strip().casefold() for label in badges}
     nav = renderer.get("navigationEndpoint")
     nav_url = _dig(nav, "commandMetadata", "webCommandMetadata", "url") or ""
-    is_live = style == "LIVE" or bool(labels & {"live", "live now"}) or "watching" in (view_text or "").casefold()
-    is_short = style == "SHORTS" or (isinstance(nav, dict) and "reelWatchEndpoint" in nav) or nav_url.startswith("/shorts/")
     return {
         "type": "video", "source": source, "id": video_id,
         "title": _text(renderer.get("title")), "url": f"{_BASE}/watch?v={video_id}",
@@ -258,7 +285,9 @@ def _video(renderer: dict, source: str = "youtube") -> dict | None:
         "duration_seconds": _duration(duration_text), "views": _number(view_text),
         "views_text": view_text, "published": _text(renderer.get("publishedTimeText")),
         "description": description, "badges": badges, **_channel_info(renderer),
-        "is_live": is_live, "is_short": is_short, "raw_type": "videoRenderer",
+        "is_live": style == "LIVE" or bool(labels & {"live", "live now"}) or "watching" in (view_text or "").casefold(),
+        "is_short": style == "SHORTS" or (isinstance(nav, dict) and "reelWatchEndpoint" in nav) or nav_url.startswith("/shorts/"),
+        "raw_type": "videoRenderer",
     }
 
 
@@ -311,17 +340,17 @@ def _lockup(renderer: dict) -> dict | None:
     if not isinstance(playlist_id, str) or not playlist_id:
         return None
     meta = _dig(renderer, "metadata", "lockupMetadataViewModel")
-    video_count = None
+    count = None
     for node in _walk(renderer.get("contentImage") or {}):
         badge = node.get("thumbnailBadgeViewModel")
-        if isinstance(badge, dict) and (video_count := _text(badge.get("text"))):
+        if isinstance(badge, dict) and (count := _text(badge.get("text"))):
             break
     return {
         "type": "playlist", "id": playlist_id, "title": _text(_dig(meta, "title")),
         "url": f"{_BASE}/playlist?list={playlist_id}",
         "thumbnail": _pick_thumbnail(_dig(renderer, "contentImage", "collectionThumbnailViewModel", "primaryThumbnail", "thumbnailViewModel", "image", "sources")),
         "owner": _text(_dig(meta, "metadata", "contentMetadataViewModel", "metadataRows", 0, "metadataParts", 0, "text")),
-        "video_count": video_count, "raw_type": "lockupViewModel",
+        "video_count": count, "raw_type": "lockupViewModel",
     }
 
 
@@ -335,7 +364,7 @@ def _music_video_id(renderer: dict, title_cell: Any) -> str | None:
         _endpoint_video_id(renderer.get("overlay")),
         _endpoint_video_id(renderer.get("menu")),
     )
-    return next((item for item in candidates if isinstance(item, str) and re.fullmatch(r"[A-Za-z0-9_-]{11}", item)), None)
+    return next((value for value in candidates if isinstance(value, str) and _RE_ID.fullmatch(value)), None)
 
 
 def _music_item(renderer: dict) -> dict | None:
@@ -347,7 +376,7 @@ def _music_item(renderer: dict) -> dict | None:
     title_cell = cell(0)
     title = _text(title_cell) or _text(renderer.get("title"))
     sub_cell = cell(1)
-    runs = sub_cell.get("runs") if isinstance(sub_cell, dict) else None
+    runs = sub_cell.get("runs") if isinstance(sub_cell, dict) else []
     artists: list[dict] = []
     album = None
     duration = None
@@ -360,7 +389,8 @@ def _music_item(renderer: dict) -> dict | None:
             continue
         browse_id = _dig(run, "navigationEndpoint", "browseEndpoint", "browseId") or ""
         if isinstance(browse_id, str) and browse_id.startswith(("UC", "MPLA")):
-            artists.append({"name": value, "id": browse_id})
+            if not any(item["id"] == browse_id for item in artists):
+                artists.append({"name": value, "id": browse_id})
         elif isinstance(browse_id, str) and browse_id.startswith("MPRE"):
             album = {"name": value, "id": browse_id}
         elif _DURATION_RE.fullmatch(value):
@@ -369,26 +399,12 @@ def _music_item(renderer: dict) -> dict | None:
             extras.append(value)
 
     for index in range(2, len(columns)):
-        extra = _text(cell(index))
-        if extra and extra not in extras and extra != duration:
-            if _DURATION_RE.fullmatch(extra):
-                duration = duration or extra
+        value = _text(cell(index))
+        if value and value not in extras and value != duration:
+            if _DURATION_RE.fullmatch(value):
+                duration = duration or value
             else:
-                extras.append(extra)
-
-    # Extract artist/album entities from all subtitle runs, including layouts
-    # where the first metadata column contains mixed text and endpoint runs.
-    if not artists and isinstance(sub_cell, dict):
-        for run in sub_cell.get("runs") or []:
-            if not isinstance(run, dict):
-                continue
-            browse_id = _dig(run, "navigationEndpoint", "browseEndpoint", "browseId")
-            value = (run.get("text") or "").strip()
-            if isinstance(browse_id, str) and browse_id.startswith(("UC", "MPLA")) and value:
-                if not any(item["id"] == browse_id for item in artists):
-                    artists.append({"name": value, "id": browse_id})
-            elif isinstance(browse_id, str) and browse_id.startswith("MPRE") and value:
-                album = {"name": value, "id": browse_id}
+                extras.append(value)
 
     subtitle = " • ".join(extras) or None
     first_artist = artists[0] if artists else {}
@@ -444,48 +460,15 @@ _HANDLERS = {
 }
 
 
-def _walk(data: Any) -> Iterator[dict]:
-    stack = [data]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            yield node
-            stack.extend(value for value in reversed(tuple(node.values())) if isinstance(value, (dict, list)))
-        elif isinstance(node, list):
-            stack.extend(value for value in reversed(node) if isinstance(value, (dict, list)))
-
-
-def _continuation(data: Any) -> str | None:
-    for node in _walk(data):
-        token = (
-            _dig(node, "continuationEndpoint", "continuationCommand", "token")
-            or _dig(node, "continuationCommand", "token")
-            or _dig(node, "nextContinuationData", "continuation")
-            or node.get("continuation")
-        )
-        if isinstance(token, str) and token:
-            return token
-    return None
-
-
-def _parse(data: dict) -> tuple[list[dict], str | None]:
+def _parse(data: dict) -> tuple[list[dict], str | None, str | None]:
     results: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    token = None
-    for node in _walk(data):
-        if token is None:
-            candidate = (
-                _dig(node, "continuationEndpoint", "continuationCommand", "token")
-                or _dig(node, "continuationCommand", "token")
-                or _dig(node, "nextContinuationData", "continuation")
-                or node.get("continuation")
-            )
-            if isinstance(candidate, str) and candidate:
-                token = candidate
-        for key, handler in _HANDLERS.items():
-            renderer = node.get(key)
-            if not isinstance(renderer, dict):
-                continue
+    token = corrected = None
+    stack: list[Any] = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, tuple):
+            handler, renderer = node
             try:
                 item = handler(renderer)
             except (KeyError, TypeError, ValueError, AttributeError, IndexError):
@@ -495,15 +478,41 @@ def _parse(data: dict) -> tuple[list[dict], str | None]:
                 if identity not in seen:
                     seen.add(identity)
                     results.append(item)
-            break
-    return results, token
+            continue
+        if isinstance(node, list):
+            stack.extend(value for value in reversed(node) if isinstance(value, (dict, list)))
+            continue
+        if not isinstance(node, dict):
+            continue
+
+        if token is None:
+            candidate = (
+                _dig(node, "continuationEndpoint", "continuationCommand", "token")
+                or _dig(node, "continuationCommand", "token")
+                or _dig(node, "nextContinuationData", "continuation")
+                or node.get("continuation")
+            )
+            if isinstance(candidate, str) and candidate:
+                token = candidate
+
+        children = []
+        for key, value in node.items():
+            if not isinstance(value, (dict, list)) or key in _SKIP_KEYS:
+                continue
+            if key in _CORRECTION_KEYS:
+                if corrected is None and isinstance(value, dict):
+                    corrected = _text(value.get("correctedQuery"))
+                continue
+            handler = _HANDLERS.get(key)
+            children.append((handler, value) if handler and isinstance(value, dict) else value)
+        stack.extend(reversed(children))
+    return results, token, corrected
 
 
 def _normalise(value: str | None) -> str:
     if not value:
         return ""
-    value = value.casefold().replace("&", " and ")
-    return " ".join(_WORD_RE.findall(value))
+    return " ".join(_WORD_RE.findall(value.casefold().replace("&", " and ")))
 
 
 def _query_tokens(query: str) -> set[str]:
@@ -518,44 +527,61 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
-def _relevance(item: dict, query: str, original_index: int) -> float:
-    """Conservative song reranker; YouTube's original order remains influential."""
+def _rank_songs(items: list[dict], query: str) -> list[dict]:
     q = _normalise(query)
-    title = _normalise(item.get("title"))
-    artists = _normalise(" ".join(item.get("artists") or []))
-    album = _normalise(item.get("album"))
-    subtitle = _normalise(item.get("subtitle"))
-    if not q or not title:
-        return -original_index * 0.02
-
+    q_all = set(q.split())
     q_tokens = _query_tokens(query)
-    title_tokens = set(title.split())
-    artist_tokens = set(artists.split())
-    all_tokens = title_tokens | artist_tokens | set(album.split()) | set(subtitle.split())
-    if not q_tokens:
-        return -original_index * 0.02
+    if not q or not q_tokens:
+        return items
 
-    title_coverage = len(q_tokens & title_tokens) / len(q_tokens)
-    broad_coverage = len(q_tokens & all_tokens) / len(q_tokens)
-    exact = 1.0 if q == title else 0.0
-    title_phrase = 1.0 if q in title else 0.0
-    artist_phrase = 1.0 if artists and artists in q else 0.0
-    title_similarity = _similarity(q, title)
-    # Do not let generic labels ("official video", "lyrics") dominate ranking.
-    score = (
-        exact * 8.0
-        + title_phrase * 3.0
-        + title_coverage * 3.0
-        + broad_coverage * 0.8
-        + title_similarity * 0.8
-        + artist_phrase * 0.7
-        - original_index * 0.018
-    )
-    return score
+    scored = []
+    for index, item in enumerate(items):
+        title = _normalise(item.get("title"))
+        if not title:
+            scored.append((-5.0 - index * 0.02, index, item))
+            continue
+        title_tokens = set(title.split())
+        artists = [_normalise(name) for name in item.get("artists") or []]
+        artist_tokens = {word for name in artists for word in name.split()}
+        extra_tokens = set(_normalise(item.get("album")).split()) | set(_normalise(item.get("subtitle")).split())
+        all_tokens = title_tokens | artist_tokens | extra_tokens
+
+        title_coverage = len(q_tokens & title_tokens) / len(q_tokens)
+        broad_coverage = len(q_tokens & all_tokens) / len(q_tokens)
+        exact = float(q == title)
+        phrase = float(q in title)
+        artist_hit = float(any(name and set(name.split()) <= q_all for name in artists))
+        score = (
+            exact * 8.0 + phrase * 3.0 + title_coverage * 3.0
+            + broad_coverage * 0.8 + _similarity(q, title) * 0.8
+            + artist_hit * 0.7 - index * 0.018
+        )
+        penalties = len((title_tokens & _PENALTY_WORDS) - q_all)
+        score -= min(penalties, 2) * 1.2
+        seconds = item.get("duration_seconds")
+        if seconds is not None and (seconds < 45 or seconds > 720):
+            score -= 0.7
+        views = item.get("views")
+        if isinstance(views, (int, float)) and views > 0:
+            score += min(0.25, 0.04 * math.log10(views + 1))
+        scored.append((score, index, item))
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    return [row[2] for row in scored]
+
+
+def _song_key(item: dict) -> tuple[str, str]:
+    artists = item.get("artists") or []
+    return _normalise(item.get("title")), _normalise(artists[0] if artists else None)
+
+
+def _clone(items: list[dict]) -> list[dict]:
+    return [
+        {key: list(value) if isinstance(value, list) else value for key, value in item.items()}
+        for item in items
+    ]
 
 
 class _TTLCache:
-    """Bounded LRU cache with lazy TTL expiration."""
     def __init__(self, maxsize: int, ttl: float):
         if isinstance(maxsize, bool) or not isinstance(maxsize, int) or maxsize < 1:
             raise ValueError("cache maxsize must be an integer >= 1")
@@ -569,8 +595,8 @@ class _TTLCache:
         entry = self.data.get(key)
         if entry is None:
             return None
-        expires, value = entry
-        if expires <= time.monotonic():
+        deadline, value = entry
+        if deadline <= time.monotonic():
             self.data.pop(key, None)
             return None
         self.data.move_to_end(key)
@@ -602,13 +628,15 @@ class YouTubeSearch:
     def __init__(
         self,
         *,
-        timeout: float = 12.0,
+        timeout: float = 6.0,
         concurrency: int = 10,
-        cache_size: int = 256,
-        cache_ttl: float = 30.0,
-        retries: int = 2,
+        cache_size: int = 512,
+        cache_ttl: float = 300.0,
+        retries: int = 1,
         language: str = "en",
-        country: str = "US",
+        country: str = "IN",
+        api_key: str | None = None,
+        http2: bool = True,
     ):
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ValueError("timeout must be > 0")
@@ -628,18 +656,27 @@ class YouTubeSearch:
         self.semaphore = asyncio.Semaphore(concurrency)
         self.cache = _TTLCache(cache_size, cache_ttl)
         self._leftovers = _TTLCache(cache_size, 600.0)
+        self._suggest_cache = _TTLCache(cache_size, 600.0)
         self.inflight: dict[tuple, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
-        self._configs: dict[str, tuple[float, dict]] = {}
         self._config_locks = {name: asyncio.Lock() for name in _CLIENTS}
+        key = api_key or _DEFAULT_API_KEY
+        now = time.monotonic()
+        self._configs: dict[str, tuple[float, dict]] = {
+            name: (now + self._CONFIG_TTL, {
+                "api_key": key, "version": spec["version"], "visitor": None,
+            })
+            for name, spec in _CLIENTS.items()
+        }
         self._closed = False
         self._close_lock = asyncio.Lock()
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout, connect=min(self.timeout, 5.0)),
+            http2=bool(http2 and _HTTP2),
+            timeout=httpx.Timeout(self.timeout, connect=min(self.timeout, 4.0)),
             limits=httpx.Limits(
                 max_connections=concurrency,
                 max_keepalive_connections=concurrency,
-                keepalive_expiry=30.0,
+                keepalive_expiry=60.0,
             ),
             headers={
                 "User-Agent": (
@@ -674,30 +711,36 @@ class YouTubeSearch:
             self.inflight.clear()
             self.cache.clear()
             self._leftovers.clear()
+            self._suggest_cache.clear()
             self._configs.clear()
 
     async def close_client(self) -> None:
         await self.close()
 
     async def warmup(self) -> None:
+        """Load config only; never run a fake search query."""
         if self._closed:
             raise YouTubeSearchError("Client is closed.")
         await self._get_config("web")
+        await self._get_config("music")
 
-    async def _get_config(self, site: str) -> dict:
+    async def _get_config(self, site: str, *, force: bool = False) -> dict:
         if self._closed:
             raise YouTubeSearchError("Client is closed.")
         if site not in _CLIENTS:
             raise ValueError(f"Unsupported YouTube client: {site}")
+
         cached = self._configs.get(site)
-        if cached and cached[0] > time.monotonic():
+        if not force and cached and cached[0] > time.monotonic():
             return cached[1]
 
+        # Music uses WEB's public key + visitor data, as in the deadlock-fixed
+        # repository implementation. Locks are per-site, never recursively held.
         if site == "music":
-            web_config = await self._get_config("web")
+            web_config = await self._get_config("web", force=force)
             async with self._config_locks["music"]:
                 cached = self._configs.get("music")
-                if cached and cached[0] > time.monotonic():
+                if not force and cached and cached[0] > time.monotonic():
                     return cached[1]
                 config = {
                     "api_key": web_config["api_key"],
@@ -707,11 +750,11 @@ class YouTubeSearch:
                 self._configs["music"] = (time.monotonic() + self._CONFIG_TTL, config)
                 return config
 
-        async with self._config_locks[site]:
-            cached = self._configs.get(site)
-            if cached and cached[0] > time.monotonic():
+        async with self._config_locks["web"]:
+            cached = self._configs.get("web")
+            if not force and cached and cached[0] > time.monotonic():
                 return cached[1]
-            spec = _CLIENTS[site]
+            spec = _CLIENTS["web"]
             try:
                 response = await self.client.get(
                     spec["url"],
@@ -720,7 +763,6 @@ class YouTubeSearch:
                 response.raise_for_status()
             except httpx.HTTPError as exc:
                 raise YouTubeSearchError(f"YouTube configuration request failed: {exc}") from exc
-
             html = response.text
             api_key = _RE_API_KEY.search(html)
             version = _RE_VERSION.search(html)
@@ -732,7 +774,7 @@ class YouTubeSearch:
                 "version": version.group(1) if version else spec["version"],
                 "visitor": visitor.group(1) if visitor else None,
             }
-            self._configs[site] = (time.monotonic() + self._CONFIG_TTL, config)
+            self._configs["web"] = (time.monotonic() + self._CONFIG_TTL, config)
             return config
 
     @staticmethod
@@ -747,11 +789,9 @@ class YouTubeSearch:
                     return min(max(retry_date.timestamp() - time.time(), 0.0), 10.0)
                 except (TypeError, ValueError, OverflowError):
                     pass
-        return min(8.0, 0.35 * (2 ** attempt) + random.uniform(0.05, 0.25))
+        return min(8.0, 0.3 * (2 ** attempt) + random.uniform(0.05, 0.2))
 
     async def _post(self, url: str, body: dict, params: dict, headers: dict) -> dict:
-        if self._closed:
-            raise YouTubeSearchError("Client is closed.")
         last_error: Exception | None = None
         for attempt in range(self.retries + 1):
             if self._closed:
@@ -759,36 +799,31 @@ class YouTubeSearch:
             try:
                 async with self.semaphore:
                     response = await self.client.post(url, params=params, json=body, headers=headers)
-                if response.status_code in self._RETRY_STATUS and attempt < self.retries:
-                    await asyncio.sleep(self._delay(attempt, response))
-                    continue
-                response.raise_for_status()
-                try:
-                    data = response.json()
-                except ValueError as exc:
-                    raise YouTubeSearchError("YouTube returned invalid JSON.") from exc
-                if not isinstance(data, dict):
-                    raise YouTubeSearchError("Unexpected YouTube response.")
-                return data
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                if status in self._RETRY_STATUS and attempt < self.retries:
-                    await asyncio.sleep(self._delay(attempt, exc.response))
-                    continue
-                raise YouTubeSearchError(
-                    f"YouTube returned HTTP {status}: {exc.response.text[:300]}"
-                ) from exc
             except httpx.RequestError as exc:
                 last_error = exc
                 if attempt < self.retries:
                     await asyncio.sleep(self._delay(attempt))
                     continue
                 break
+
+            if response.status_code in self._RETRY_STATUS and attempt < self.retries:
+                await asyncio.sleep(self._delay(attempt, response))
+                continue
+            if response.status_code >= 400:
+                raise _HttpStatusError(
+                    response.status_code,
+                    f"YouTube returned HTTP {response.status_code}: {response.text[:200]}",
+                )
+            try:
+                data = _loads(response.content)
+            except (ValueError, TypeError) as exc:
+                raise YouTubeSearchError("YouTube returned invalid JSON.") from exc
+            if not isinstance(data, dict):
+                raise YouTubeSearchError("Unexpected YouTube response.")
+            return data
         raise YouTubeSearchError(f"YouTube request failed: {last_error}") from last_error
 
-    async def _request(self, query: str, *, filter_name: str, continuation: str | None = None) -> dict:
-        if self._closed:
-            raise YouTubeSearchError("Client is closed.")
+    async def _send(self, query: str, filter_name: str, continuation: str | None) -> dict:
         search_params, site = _FILTERS[filter_name]
         spec = _CLIENTS[site]
         config = await self._get_config(site)
@@ -817,14 +852,28 @@ class YouTubeSearch:
                 body["params"] = search_params
         return await self._post(f"{spec['url']}/youtubei/v1/search", body, params, headers)
 
-    async def _fetch_page(self, query: str, filter_name: str, continuation: str | None = None) -> tuple[list[dict], str | None]:
+    async def _request(self, query: str, *, filter_name: str, continuation: str | None = None) -> dict:
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+        site = _FILTERS[filter_name][1]
+        try:
+            return await self._send(query, filter_name, continuation)
+        except _HttpStatusError as exc:
+            if exc.status not in (400, 403):
+                raise
+            # Refresh only once. Music refresh safely refreshes WEB first.
+            await self._get_config(site, force=True)
+            return await self._send(query, filter_name, continuation)
+
+    async def _fetch_page(self, query: str, filter_name: str, continuation: str | None = None):
         return _parse(await self._request(query, filter_name=filter_name, continuation=continuation))
 
-    async def _first_page(self, query: str, filter_name: str) -> tuple[list[dict], str | None]:
+    async def _first_page(self, query: str, filter_name: str):
         key = (" ".join(query.split()).casefold(), filter_name, self.language, self.country)
         cached = self.cache.get(key)
         if cached is not None:
-            return copy.deepcopy(cached)
+            items, token, corrected = cached
+            return _clone(items), token, corrected
         async with self._inflight_lock:
             if self._closed:
                 raise YouTubeSearchError("Client is closed.")
@@ -833,8 +882,8 @@ class YouTubeSearch:
                 task = asyncio.create_task(self._load_first(key, query, filter_name))
                 self.inflight[key] = task
                 task.add_done_callback(lambda current, cache_key=key: self._forget(cache_key, current))
-        result = await asyncio.shield(task)
-        return copy.deepcopy(result)
+        items, token, corrected = await asyncio.shield(task)
+        return _clone(items), token, corrected
 
     async def _load_first(self, key: tuple, query: str, filter_name: str):
         result = await self._fetch_page(query, filter_name)
@@ -853,28 +902,30 @@ class YouTubeSearch:
     def clear_cache(self) -> None:
         self.cache.clear()
         self._leftovers.clear()
+        self._suggest_cache.clear()
 
     def get_cache_stats(self) -> dict:
         return {
             "search": self.cache.stats(),
             "continuations": self._leftovers.stats(),
+            "suggestions": self._suggest_cache.stats(),
             "inflight": len(self.inflight),
             "configs": len(self._configs),
         }
 
-    def _stash(self, token: str | None, leftover: list[dict]) -> str:
+    def _stash(self, token: str | None, leftover: list[dict], seen_ids: set, seen_songs: set) -> str:
         cursor = _CURSOR_PREFIX + uuid.uuid4().hex
-        self._leftovers.set(cursor, (token, leftover))
+        self._leftovers.set(cursor, (token, _clone(leftover), set(seen_ids), set(seen_songs)))
         return cursor
 
-    def _resume(self, cursor: str) -> tuple[list[dict], str | None]:
+    def _resume(self, cursor: str):
         if not cursor.startswith(_CURSOR_PREFIX):
-            return [], cursor
+            return [], cursor, set(), set()
         entry = self._leftovers.get(cursor)
         if entry is None:
             raise YouTubeSearchError("Continuation expired. Please search again.")
-        token, items = entry
-        return copy.deepcopy(items), token
+        token, items, seen_ids, seen_songs = entry
+        return _clone(items), token, set(seen_ids), set(seen_songs)
 
     async def search(
         self,
@@ -883,6 +934,7 @@ class YouTubeSearch:
         filter: str = "all",
         limit: int = 20,
         continuation: str | None = None,
+        fallback: bool = True,
     ) -> dict:
         if self._closed:
             raise YouTubeSearchError("Client is closed.")
@@ -899,53 +951,76 @@ class YouTubeSearch:
             raise ValueError("continuation must be a non-empty string or None")
 
         query = " ".join(query.split())
+        corrected = None
         if continuation:
-            items, token = self._resume(continuation)
+            items, token, seen_ids, seen_songs = self._resume(continuation)
         else:
-            items, token = await self._first_page(query, filter)
+            items, token, corrected = await self._first_page(query, filter)
+            seen_ids, seen_songs = set(), set()
 
-        results: list[dict] = []
-        seen: set[tuple[str, str]] = set()
+        is_songs = filter == "songs"
+        pool: list[dict] = []
+        pool_ids: set[tuple[str, str]] = set()
 
         def add(batch: list[dict]) -> None:
             for item in batch:
                 if not isinstance(item, dict) or not item.get("id"):
                     continue
                 identity = (str(item.get("type", "")), str(item["id"]))
-                if identity not in seen:
-                    seen.add(identity)
-                    results.append(item)
+                if identity not in seen_ids and identity not in pool_ids:
+                    pool_ids.add(identity)
+                    pool.append(item)
 
         add(items)
+
+        # Do not fetch extra pages just to pad the first search. Only continue
+        # when the requested limit cannot be satisfied by the current page.
         pages = 1
         seen_tokens: set[str] = set()
-        while len(results) < limit and token and pages < self._MAX_PAGES:
+        while len(pool) < limit and token and pages < self._MAX_PAGES:
             if token in seen_tokens:
                 token = None
                 break
             seen_tokens.add(token)
-            previous_token = token
-            items, token = await self._fetch_page(query, filter, token)
+            previous = token
+            items, token, _ = await self._fetch_page(query, filter, previous)
             add(items)
             pages += 1
-            if token == previous_token:
+            if token == previous:
                 token = None
                 break
 
-        if filter == "songs" and len(results) > 1:
-            ranked = sorted(
-                enumerate(results),
-                key=lambda pair: _relevance(pair[1], query, pair[0]),
-                reverse=True,
-            )
-            results = [item for _, item in ranked]
+        if is_songs:
+            if not continuation and len(pool) > 1:
+                pool = _rank_songs(pool, query)
+            local_song_keys = set(seen_songs)
+            unique = []
+            for item in pool:
+                if item.get("type") == "song":
+                    key = _song_key(item)
+                    if key[0] and key in local_song_keys:
+                        continue
+                    local_song_keys.add(key)
+                unique.append(item)
+            pool = unique
 
-        leftover = results[limit:]
-        results = results[:limit]
-        cursor = self._stash(token, leftover) if leftover else token
+        results = pool[:limit]
+        leftover = pool[limit:]
+        for item in results:
+            seen_ids.add((str(item.get("type", "")), str(item["id"])))
+            if is_songs and item.get("type") == "song":
+                seen_songs.add(_song_key(item))
+
+        if not results and not continuation and is_songs and fallback:
+            result = await self.search(query, filter="videos", limit=limit, fallback=False)
+            result["fallback_from"] = "songs"
+            return result
+
+        cursor = self._stash(token, leftover, seen_ids, seen_songs) if (leftover or token) else None
         return {
             "query": query, "filter": filter, "results": results,
-            "continuation": cursor, "has_more": bool(cursor), "count": len(results),
+            "continuation": cursor, "has_more": bool(cursor),
+            "count": len(results), "corrected_query": corrected,
         }
 
     async def next_page(self, previous_result: dict, *, limit: int = 20) -> dict:
@@ -955,7 +1030,8 @@ class YouTubeSearch:
         if not token:
             return {
                 "query": previous_result.get("query"), "filter": previous_result.get("filter"),
-                "results": [], "continuation": None, "has_more": False, "count": 0,
+                "results": [], "continuation": None, "has_more": False,
+                "count": 0, "corrected_query": None,
             }
         return await self.search(
             previous_result.get("query", ""),
@@ -963,6 +1039,53 @@ class YouTubeSearch:
             limit=limit,
             continuation=token,
         )
+
+    async def search_many(self, queries: list[str], *, filter: str = "all", limit: int = 20):
+        outcomes = await asyncio.gather(
+            *(self.search(query, filter=filter, limit=limit) for query in queries),
+            return_exceptions=True,
+        )
+        return [
+            outcome if isinstance(outcome, (dict, YouTubeSearchError)) else _raise(outcome)
+            for outcome in outcomes
+        ]
+
+    async def suggest(self, query: str, *, limit: int = 10) -> list[str]:
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be an integer >= 1")
+        query = " ".join(query.split())
+        key = (query.casefold(), self.language)
+        cached = self._suggest_cache.get(key)
+        if cached is not None:
+            return list(cached[:limit])
+        try:
+            async with self.semaphore:
+                response = await self.client.get(
+                    _SUGGEST_URL,
+                    params={
+                        "client": "firefox", "ds": "yt", "hl": self.language,
+                        "oe": "utf-8", "q": query,
+                    },
+                )
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise YouTubeSearchError(f"Suggestion request failed: {exc}") from exc
+        try:
+            data = _loads(response.content)
+        except (ValueError, TypeError) as exc:
+            raise YouTubeSearchError("Suggestion response was not valid JSON.") from exc
+        raw = data[1] if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list) else []
+        suggestions = []
+        for entry in raw:
+            value = entry[0] if isinstance(entry, list) and entry else entry
+            if isinstance(value, str) and value and value not in suggestions:
+                suggestions.append(value)
+        self._suggest_cache.set(key, suggestions)
+        return suggestions[:limit]
 
     async def search_music(self, query: str, *, limit: int = 20):
         return await self.search(query, filter="songs", limit=limit)
@@ -987,6 +1110,10 @@ class YouTubeSearch:
 
     async def ytsearch(self, query: str, *, limit: int = 20):
         return await self.search(query, limit=limit)
+
+
+def _raise(exc: BaseException):
+    raise exc
 
 
 __all__ = ["YouTubeSearch", "YouTubeSearchError"]
