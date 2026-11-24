@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import asyncio
@@ -12,9 +13,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import httpx
-
-
-
 
 
 class YouTubeSearchError(Exception):
@@ -92,6 +90,7 @@ def _text(value: Any) -> str | None:
             return result
 
     runs = value.get("runs")
+
     if isinstance(runs, list):
         result = "".join(
             item.get("text", "")
@@ -128,10 +127,12 @@ def _duration(value: str | None) -> int | None:
         return None
 
     value = value.strip()
+
     if not _DURATION_RE.fullmatch(value):
         return None
 
     seconds = 0
+
     for part in value.split(":"):
         seconds = seconds * 60 + int(part)
 
@@ -141,8 +142,10 @@ def _duration(value: str | None) -> int | None:
 def _abs_url(url: str) -> str:
     if url.startswith("//"):
         return "https:" + url
+
     if url.startswith("/"):
         return _BASE + url
+
     return url
 
 
@@ -151,8 +154,10 @@ def _pick_thumbnail(thumbs: Any) -> str | None:
         for item in reversed(thumbs):
             if isinstance(item, dict):
                 url = item.get("url")
+
                 if isinstance(url, str) and url:
                     return _abs_url(url)
+
     return None
 
 
@@ -185,6 +190,7 @@ def _thumbnail(renderer: dict) -> str | None:
 
     for thumbs in candidates:
         result = _pick_thumbnail(thumbs)
+
         if result:
             return result
 
@@ -196,6 +202,7 @@ def _badges(renderer: dict) -> list[str]:
 
     for badge in renderer.get("badges") or []:
         meta = _dig(badge, "metadataBadgeRenderer")
+
         if not isinstance(meta, dict):
             continue
 
@@ -215,6 +222,7 @@ def _is_verified(renderer: dict) -> bool:
     for key in ("ownerBadges", "badges"):
         for badge in renderer.get(key) or []:
             meta = _dig(badge, "metadataBadgeRenderer")
+
             if not isinstance(meta, dict):
                 continue
 
@@ -261,6 +269,7 @@ def _channel_info(renderer: dict) -> dict:
             path = path or browse.get("canonicalBaseUrl")
 
         text = run.get("text") or ""
+
         if text.startswith("@"):
             handle = handle or text
 
@@ -273,7 +282,11 @@ def _channel_info(renderer: dict) -> dict:
     return {
         "channel_name": _text(owner),
         "channel_id": channel_id,
-        "channel_url": _BASE + path if path and path.startswith("/") else None,
+        "channel_url": (
+            _BASE + path
+            if path and path.startswith("/")
+            else None
+        ),
         "channel_handle": handle,
         "channel_verified": _is_verified(renderer),
     }
@@ -281,6 +294,7 @@ def _channel_info(renderer: dict) -> dict:
 
 def _video(renderer: dict, source: str = "youtube") -> dict | None:
     video_id = renderer.get("videoId")
+
     if not isinstance(video_id, str) or not video_id:
         return None
 
@@ -299,8 +313,9 @@ def _video(renderer: dict, source: str = "youtube") -> dict | None:
 
     style = status.get("style")
 
-    duration_text = _text(renderer.get("lengthText")) or _text(
-        status.get("text")
+    duration_text = (
+        _text(renderer.get("lengthText"))
+        or _text(status.get("text"))
     )
 
     if duration_text and not _DURATION_RE.fullmatch(duration_text.strip()):
@@ -327,6 +342,7 @@ def _video(renderer: dict, source: str = "youtube") -> dict | None:
     labels = {item.strip().lower() for item in badges}
 
     nav = renderer.get("navigationEndpoint")
+
     nav_url = (
         _dig(nav, "commandMetadata", "webCommandMetadata", "url")
         or ""
@@ -482,8 +498,10 @@ def _lockup(renderer: dict) -> dict | None:
 
     for node in _walk(renderer.get("contentImage") or {}):
         badge = node.get("thumbnailBadgeViewModel")
+
         if isinstance(badge, dict):
             video_count = _text(badge.get("text"))
+
             if video_count:
                 break
 
@@ -705,21 +723,15 @@ def _walk(data: Any) -> Iterator[dict]:
 
         if isinstance(node, dict):
             yield node
-            children = [
-                value
-                for value in node.values()
-                if isinstance(value, (dict, list))
-            ]
-        elif isinstance(node, list):
-            children = [
-                value
-                for value in node
-                if isinstance(value, (dict, list))
-            ]
-        else:
-            continue
 
-        stack.extend(reversed(children))
+            for value in reversed(tuple(node.values())):
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+
+        elif isinstance(node, list):
+            for value in reversed(node):
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
 
 
 def _continuation(data: Any) -> str | None:
@@ -753,12 +765,28 @@ _HANDLERS = (
     ("musicResponsiveListItemRenderer", _music_item),
 )
 
+_HANDLER_MAP = dict(_HANDLERS)
+
 
 def _parse(data: dict) -> tuple[list[dict], str | None]:
     results = []
     seen = set()
+    token = None
 
     for node in _walk(data):
+        if token is None:
+            token = (
+                _dig(
+                    node,
+                    "continuationEndpoint",
+                    "continuationCommand",
+                    "token",
+                )
+                or _dig(node, "continuationCommand", "token")
+                or _dig(node, "nextContinuationData", "continuation")
+                or node.get("continuation")
+            )
+
         for key, handler in _HANDLERS:
             renderer = node.get(key)
 
@@ -776,15 +804,19 @@ def _parse(data: dict) -> tuple[list[dict], str | None]:
 
             break
 
-    return results, _continuation(data)
+    return (
+        results,
+        token if isinstance(token, str) else None,
+    )
 
 
 class _TTLCache:
-    """Bounded TTL cache."""
+    """Bounded TTL cache with LRU eviction."""
 
     def __init__(self, maxsize: int, ttl: float):
         if maxsize < 1:
             raise ValueError("cache maxsize must be >= 1")
+
         if ttl <= 0:
             raise ValueError("cache ttl must be > 0")
 
@@ -809,6 +841,7 @@ class _TTLCache:
 
     def set(self, key, value):
         now = time.monotonic()
+
         self.data.pop(key, None)
         self.data[key] = (now + self.ttl, value)
 
@@ -820,6 +853,7 @@ class _TTLCache:
 
     def stats(self):
         now = time.monotonic()
+
         expired = [
             key
             for key, (expires, _) in self.data.items()
@@ -837,11 +871,18 @@ class _TTLCache:
 
 
 class YouTubeSearch:
-    """Async YouTube and YouTube Music search client."""
+    """High-performance async YouTube and YouTube Music search client."""
 
     _CONFIG_TTL = 3600.0
     _MAX_PAGES = 5
-    _RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+
+    _RETRY_STATUS = frozenset({
+        429,
+        500,
+        502,
+        503,
+        504,
+    })
 
     def __init__(
         self,
@@ -854,13 +895,16 @@ class YouTubeSearch:
     ):
         if timeout <= 0:
             raise ValueError("timeout must be > 0")
+
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
+
         if isinstance(retries, bool) or not isinstance(retries, int):
             raise ValueError("retries must be an integer")
 
         self.timeout = timeout
         self.retries = max(0, retries)
+
         self.semaphore = asyncio.Semaphore(concurrency)
 
         self.cache = _TTLCache(cache_size, cache_ttl)
@@ -869,10 +913,14 @@ class YouTubeSearch:
         self.inflight: dict[tuple, asyncio.Task] = {}
 
         self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout),
+            timeout=httpx.Timeout(
+                timeout,
+                connect=min(timeout, 5.0),
+            ),
             limits=httpx.Limits(
                 max_connections=concurrency,
                 max_keepalive_connections=concurrency,
+                keepalive_expiry=30.0,
             ),
             headers={
                 "User-Agent": (
@@ -885,10 +933,19 @@ class YouTubeSearch:
             follow_redirects=True,
         )
 
-        self.client.cookies.set("SOCS", "CAI", domain=".youtube.com")
+        self.client.cookies.set(
+            "SOCS",
+            "CAI",
+            domain=".youtube.com",
+        )
 
         self._configs: dict[str, tuple[float, dict]] = {}
-        self._config_lock = asyncio.Lock()
+
+        self._config_locks = {
+            name: asyncio.Lock()
+            for name in _CLIENTS
+        }
+
         self._closed = False
 
     async def __aenter__(self):
@@ -909,9 +966,16 @@ class YouTubeSearch:
             task.cancel()
 
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
 
         await self.client.aclose()
+
+        self.inflight.clear()
+        self.cache.clear()
+        self._leftovers.clear()
 
     async def close_client(self):
         await self.close()
@@ -920,13 +984,53 @@ class YouTubeSearch:
     # Configuration
     # --------------------------------------------------
 
+    async def warmup(self) -> None:
+        """Load public YouTube configuration before searching."""
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+
+        await self._get_config("web")
+
     async def _get_config(self, site: str) -> dict:
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+
+        if site not in _CLIENTS:
+            raise ValueError(
+                f"Unsupported YouTube client: {site}"
+            )
+
+        now = time.monotonic()
         cached = self._configs.get(site)
 
-        if cached and cached[0] > time.monotonic():
+        if cached and cached[0] > now:
             return cached[1]
 
-        async with self._config_lock:
+        # Music uses WEB's public API key and visitor data.
+        # This avoids an unnecessary second homepage request.
+        if site == "music":
+            web_config = await self._get_config("web")
+
+            async with self._config_locks["music"]:
+                cached = self._configs.get("music")
+
+                if cached and cached[0] > time.monotonic():
+                    return cached[1]
+
+                config = {
+                    "api_key": web_config["api_key"],
+                    "version": _CLIENTS["music"]["version"],
+                    "visitor": web_config.get("visitor"),
+                }
+
+                self._configs["music"] = (
+                    time.monotonic() + self._CONFIG_TTL,
+                    config,
+                )
+
+                return config
+
+        async with self._config_locks[site]:
             cached = self._configs.get(site)
 
             if cached and cached[0] > time.monotonic():
@@ -941,6 +1045,7 @@ class YouTubeSearch:
                         "Accept": "text/html,application/xhtml+xml",
                     },
                 )
+
                 response.raise_for_status()
 
             except httpx.HTTPError as exc:
@@ -954,41 +1059,24 @@ class YouTubeSearch:
             version = _RE_VERSION.search(html)
             visitor = _RE_VISITOR.search(html)
 
-            # Music homepage frequently omits these fields.
-            # Use its configured WEB_REMIX version and obtain the
-            # public Innertube API key from the regular homepage.
-            if site == "music":
-                web_config = await self._get_config("web")
+            if not api_key:
+                raise YouTubeSearchError(
+                    "Could not find YouTube Innertube API key."
+                )
 
-                config = {
-                    "api_key": web_config["api_key"],
-                    "version": (
-                        version.group(1)
-                        if version
-                        else spec["version"]
-                    ),
-                    "visitor": (
-                        visitor.group(1)
-                        if visitor
-                        else web_config["visitor"]
-                    ),
-                }
-
-            else:
-                if not api_key:
-                    raise YouTubeSearchError(
-                        "Could not find YouTube Innertube API key."
-                    )
-
-                config = {
-                    "api_key": api_key.group(1),
-                    "version": (
-                        version.group(1)
-                        if version
-                        else spec["version"]
-                    ),
-                    "visitor": visitor.group(1) if visitor else None,
-                }
+            config = {
+                "api_key": api_key.group(1),
+                "version": (
+                    version.group(1)
+                    if version
+                    else spec["version"]
+                ),
+                "visitor": (
+                    visitor.group(1)
+                    if visitor
+                    else None
+                ),
+            }
 
             self._configs[site] = (
                 time.monotonic() + self._CONFIG_TTL,
@@ -1010,11 +1098,14 @@ class YouTubeSearch:
             retry_after = response.headers.get("Retry-After", "")
 
             try:
-                return min(float(retry_after), 10.0)
+                return min(max(float(retry_after), 0.0), 10.0)
             except (TypeError, ValueError):
                 pass
 
-        return 0.4 * (2 ** attempt) + random.uniform(0, 0.2)
+        return (
+            0.4 * (2 ** attempt)
+            + random.uniform(0.0, 0.2)
+        )
 
     async def _post(
         self,
@@ -1023,9 +1114,15 @@ class YouTubeSearch:
         params: dict,
         headers: dict,
     ) -> dict:
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+
         last_error = None
 
         for attempt in range(self.retries + 1):
+            if self._closed:
+                raise YouTubeSearchError("Client is closed.")
+
             try:
                 async with self.semaphore:
                     response = await self.client.post(
@@ -1039,13 +1136,16 @@ class YouTubeSearch:
                     response.status_code in self._RETRY_STATUS
                     and attempt < self.retries
                 ):
-                    await asyncio.sleep(self._delay(attempt, response))
+                    await asyncio.sleep(
+                        self._delay(attempt, response)
+                    )
                     continue
 
                 response.raise_for_status()
 
                 try:
                     data = response.json()
+
                 except ValueError as exc:
                     raise YouTubeSearchError(
                         "YouTube returned invalid JSON."
@@ -1086,8 +1186,12 @@ class YouTubeSearch:
         filter_name: str,
         continuation: str | None = None,
     ) -> dict:
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+
         search_params, site = _FILTERS[filter_name]
         spec = _CLIENTS[site]
+
         config = await self._get_config(site)
 
         client = {
@@ -1108,10 +1212,10 @@ class YouTubeSearch:
             client["visitorData"] = config["visitor"]
             headers["X-Goog-Visitor-Id"] = config["visitor"]
 
-        params = {"prettyPrint": "false"}
-
-        if config.get("api_key"):
-            params["key"] = config["api_key"]
+        params = {
+            "prettyPrint": "false",
+            "key": config["api_key"],
+        }
 
         body: dict[str, Any] = {
             "context": {
@@ -1151,6 +1255,7 @@ class YouTubeSearch:
             filter_name=filter_name,
             continuation=continuation,
         )
+
         return _parse(data)
 
     # --------------------------------------------------
@@ -1180,16 +1285,29 @@ class YouTubeSearch:
             )
 
             self.inflight[key] = task
+
             task.add_done_callback(
                 lambda current, cache_key=key:
                 self._forget(cache_key, current)
             )
 
-        return copy.deepcopy(await asyncio.shield(task))
+        result = await asyncio.shield(task)
 
-    async def _load_first(self, key, query, filter_name):
-        result = await self._fetch_page(query, filter_name)
+        return copy.deepcopy(result)
+
+    async def _load_first(
+        self,
+        key,
+        query,
+        filter_name,
+    ):
+        result = await self._fetch_page(
+            query,
+            filter_name,
+        )
+
         self.cache.set(key, result)
+
         return result
 
     def _forget(self, key, task):
@@ -1217,7 +1335,12 @@ class YouTubeSearch:
 
     def _stash(self, token, leftover):
         cursor = _CURSOR_PREFIX + uuid.uuid4().hex
-        self._leftovers.set(cursor, (token, leftover))
+
+        self._leftovers.set(
+            cursor,
+            (token, leftover),
+        )
+
         return cursor
 
     def _resume(self, cursor):
@@ -1232,6 +1355,7 @@ class YouTubeSearch:
             )
 
         token, items = entry
+
         return copy.deepcopy(items), token
 
     # --------------------------------------------------
@@ -1250,7 +1374,9 @@ class YouTubeSearch:
             raise YouTubeSearchError("Client is closed.")
 
         if not isinstance(query, str) or not query.strip():
-            raise ValueError("query must be a non-empty string")
+            raise ValueError(
+                "query must be a non-empty string"
+            )
 
         if not isinstance(filter, str):
             raise ValueError("filter must be a string")
@@ -1273,23 +1399,33 @@ class YouTubeSearch:
             )
 
         if continuation is not None and not isinstance(
-            continuation, str
+            continuation,
+            str,
         ):
-            raise ValueError("continuation must be a string")
+            raise ValueError(
+                "continuation must be a string"
+            )
 
         query = query.strip()
 
         if continuation:
             items, token = self._resume(continuation)
+
         else:
-            items, token = await self._first_page(query, filter)
+            items, token = await self._first_page(
+                query,
+                filter,
+            )
 
         results = []
         seen = set()
 
         def add(batch):
             for item in batch:
-                identity = (item["type"], item["id"])
+                identity = (
+                    item["type"],
+                    item["id"],
+                )
 
                 if identity not in seen:
                     seen.add(identity)
@@ -1316,7 +1452,11 @@ class YouTubeSearch:
         leftover = results[limit:]
         results = results[:limit]
 
-        cursor = self._stash(token, leftover) if leftover else token
+        cursor = (
+            self._stash(token, leftover)
+            if leftover
+            else token
+        )
 
         return {
             "query": query,
@@ -1352,29 +1492,102 @@ class YouTubeSearch:
             continuation=token,
         )
 
-    async def search_music(self, query: str, *, limit: int = 20):
-        return await self.search(query, filter="songs", limit=limit)
+    async def search_music(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            filter="songs",
+            limit=limit,
+        )
 
-    async def search_videos(self, query: str, *, limit: int = 20):
-        return await self.search(query, filter="videos", limit=limit)
+    async def search_videos(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            filter="videos",
+            limit=limit,
+        )
 
-    async def search_songs(self, query: str, *, limit: int = 20):
-        return await self.search_music(query, limit=limit)
+    async def search_songs(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search_music(
+            query,
+            limit=limit,
+        )
 
-    async def search_channels(self, query: str, *, limit: int = 20):
-        return await self.search(query, filter="channels", limit=limit)
+    async def search_channels(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            filter="channels",
+            limit=limit,
+        )
 
-    async def search_albums(self, query: str, *, limit: int = 20):
-        return await self.search(query, filter="albums", limit=limit)
+    async def search_albums(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            filter="albums",
+            limit=limit,
+        )
 
-    async def search_artists(self, query: str, *, limit: int = 20):
-        return await self.search(query, filter="artists", limit=limit)
+    async def search_artists(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            filter="artists",
+            limit=limit,
+        )
 
-    async def search_playlists(self, query: str, *, limit: int = 20):
-        return await self.search(query, filter="playlists", limit=limit)
+    async def search_playlists(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            filter="playlists",
+            limit=limit,
+        )
 
-    async def ytsearch(self, query: str, *, limit: int = 20):
-        return await self.search(query, limit=limit)
+    async def ytsearch(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+    ):
+        return await self.search(
+            query,
+            limit=limit,
+        )
 
 
-__all__ = ["YouTubeSearch", "YouTubeSearchError"]
+__all__ = [
+    "YouTubeSearch",
+    "YouTubeSearchError",
+]
