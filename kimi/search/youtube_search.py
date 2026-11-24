@@ -1,23 +1,3 @@
-
-"""Async public YouTube / YouTube Music search.
-
-Requires:
-    pip install httpx
-
-Example:
-    async with YouTubeSearch() as yt:
-        page = await yt.search("Arijit Singh", filter="songs", limit=20)
-
-        for item in page["results"]:
-            print(item["title"], item["url"])
-
-        if page["has_more"]:
-            page = await yt.next_page(page)
-
-Result types:
-    video, channel, playlist, song, album, artist, music_entity
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -34,7 +14,7 @@ from typing import Any
 import httpx
 
 
-__all__ = ["YouTubeSearch", "YouTubeSearchError"]
+
 
 
 class YouTubeSearchError(Exception):
