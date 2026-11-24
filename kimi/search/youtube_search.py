@@ -1375,3 +1375,6 @@ class YouTubeSearch:
 
     async def ytsearch(self, query: str, *, limit: int = 20):
         return await self.search(query, limit=limit)
+
+
+__all__ = ["YouTubeSearch", "YouTubeSearchError"]
