@@ -1636,6 +1636,8 @@ class YouTubeExtractor:
         await self.playlist_cache.put(cache_key, result)
         return result
 
+    
+
     async def download_format(
         self,
         video_id: str,
@@ -1659,62 +1661,109 @@ class YouTubeExtractor:
             64 * 1024,
             min(int(chunk_size), 8 * 1024 * 1024),
         )
-        max_url_refreshes = max(0, min(int(max_url_refreshes), 5))
+        max_url_refreshes = max(
+            0,
+            min(int(max_url_refreshes), 5),
+        )
 
         output_path = Path(output).expanduser()
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        part_path = output_path.with_name(output_path.name + ".part")
+        part_path = output_path.with_name(
+            output_path.name + ".part"
+        )
 
         async with self._download_semaphore:
-            info = await self.extract(video_id, options=options)
-
-            selected = next(
-                (
-                    item for item in info.get("formats", [])
-                    if item.get("itag") == itag
-                ),
-                None,
+            info = await self.extract(
+                video_id,
+                options=options,
             )
+
+            def find_format(data):
+                return next(
+                    (
+                        item
+                        for item in data.get("formats", [])
+                        if item.get("itag") == itag
+                        and item.get("url")
+                    ),
+                    None,
+                )
+
+            selected = find_format(info)
 
             if not selected:
                 raise YouTubeUnavailable(
-                    f"Format itag {itag} is not available."
+                    f"Format itag {itag} is unavailable."
                 )
 
-            if not selected.get("url"):
-                raise YouTubeUnavailable(
-                    "This format has no direct URL. Signature or n "
-                    "deciphering is not implemented."
-                )
+            expected_size = safe_int(
+                selected.get("content_length")
+            )
 
-            expected_size = selected.get("content_length")
+            if expected_size is not None and expected_size <= 0:
+                expected_size = None
 
-            if resume and part_path.exists():
+            if resume and part_path.is_file():
                 downloaded = part_path.stat().st_size
             else:
                 downloaded = 0
                 part_path.unlink(missing_ok=True)
 
-            if expected_size is not None and downloaded > expected_size:
+            if (
+                expected_size is not None
+                and downloaded > expected_size
+            ):
                 part_path.unlink(missing_ok=True)
                 downloaded = 0
 
+            if (
+                expected_size is not None
+                and downloaded == expected_size
+            ):
+                part_path.replace(output_path)
+
+                return {
+                    "id": video_id,
+                    "itag": itag,
+                    "path": str(output_path),
+                    "size": downloaded,
+                    "format": selected,
+                    "resumed": True,
+                    "url_refreshes": 0,
+                }
+
             refreshes = 0
+            initial_downloaded = downloaded
 
             while True:
+                if (
+                    expected_size is not None
+                    and downloaded >= expected_size
+                ):
+                    break
+
                 current_url = selected.get("url")
+
                 if not current_url:
-                    raise YouTubeUnavailable("No direct media URL available.")
+                    raise YouTubeUnavailable(
+                        "Refreshed media URL is missing."
+                    )
+
+                range_end = downloaded + chunk_size - 1
+
+                if expected_size is not None:
+                    range_end = min(
+                        range_end,
+                        expected_size - 1,
+                    )
 
                 headers = {
                     "User-Agent": _ANDROID_UA,
                     "Accept": "*/*",
                     "Accept-Encoding": "identity",
+                    "Range": f"bytes={downloaded}-{range_end}",
                 }
-
-                if downloaded:
-                    headers["Range"] = f"bytes={downloaded}-"
 
                 refresh_needed = False
 
@@ -1735,50 +1784,66 @@ class YouTubeExtractor:
                                 f"Media server returned HTTP {status}."
                             )
 
-                        elif status not in (200, 206):
-                            raise YouTubeRequestError(
-                                f"Media download failed with HTTP {status}."
+                        elif status == 416:
+                            total = parse_unsatisfied_range(
+                                response.headers.get(
+                                    "Content-Range", ""
+                                )
                             )
 
-                        if not refresh_needed:
-                            if status == 200 and downloaded:
-                                # Server ignored Range: restart from zero.
-                                downloaded = 0
+                            if (
+                                total is not None
+                                and downloaded == total
+                            ):
+                                expected_size = total
+                                break
 
-                            if status == 206:
-                                parsed_range = parse_content_range(
-                                    response.headers.get("Content-Range", "")
+                            raise YouTubeRequestError(
+                                "Media server rejected the requested "
+                                "byte range (HTTP 416)."
+                            )
+
+                        elif status == 206:
+                            parsed = parse_content_range(
+                                response.headers.get(
+                                    "Content-Range", ""
+                                )
+                            )
+
+                            if not parsed:
+                                raise YouTubeRequestError(
+                                    "Missing or invalid Content-Range."
                                 )
 
-                                if not parsed_range:
+                            start, end, total = parsed
+
+                            if start != downloaded:
+                                raise YouTubeRequestError(
+                                    "Unexpected media range offset."
+                                )
+
+                            if end > range_end:
+                                raise YouTubeRequestError(
+                                    "Server returned data beyond "
+                                    "the requested range."
+                                )
+
+                            if total is not None:
+                                if (
+                                    expected_size is not None
+                                    and expected_size != total
+                                ):
                                     raise YouTubeRequestError(
-                                        "Invalid Content-Range response."
+                                        "Media size changed during "
+                                        "download."
                                     )
 
-                                range_start, range_end, range_total = (
-                                    parsed_range
-                                )
+                                expected_size = total
 
-                                if range_start != downloaded:
-                                    raise YouTubeRequestError(
-                                        "Unexpected range offset returned "
-                                        "by the media server."
-                                    )
-
-                                if range_total is not None:
-                                    expected_size = range_total
-
-                                expected_chunk = range_end - range_start + 1
-                            else:
-                                content_length = safe_int(
-                                    response.headers.get("Content-Length")
-                                )
-                                if content_length is not None:
-                                    expected_size = content_length
-                                expected_chunk = expected_size
+                            expected_chunk = end - start + 1
+                            received = 0
 
                             mode = "ab" if downloaded else "wb"
-                            received_this_response = 0
 
                             with part_path.open(mode) as file:
                                 async for chunk in response.aiter_bytes(
@@ -1788,57 +1853,143 @@ class YouTubeExtractor:
                                         continue
 
                                     file.write(chunk)
-                                    downloaded += len(chunk)
-                                    received_this_response += len(chunk)
+                                    received += len(chunk)
+
+                                file.flush()
+
+                            if received != expected_chunk:
+                                raise YouTubeRequestError(
+                                    "Incomplete media range: "
+                                    f"expected {expected_chunk} bytes, "
+                                    f"received {received}."
+                                )
+
+                            downloaded += received
+
+                        elif status == 200:
+                            # Server ignored Range and returned
+                            # the complete resource. Restart safely.
+                            content_length = safe_int(
+                                response.headers.get(
+                                    "Content-Length"
+                                )
+                            )
+
+                            if content_length is not None:
+                                expected_size = content_length
+
+                            downloaded = 0
+                            received = 0
+
+                            with part_path.open("wb") as file:
+                                async for chunk in response.aiter_bytes(
+                                    chunk_size
+                                ):
+                                    if not chunk:
+                                        continue
+
+                                    file.write(chunk)
+                                    received += len(chunk)
+
+                                file.flush()
+
+                            downloaded = received
 
                             if (
-                                expected_chunk is not None
-                                and received_this_response != expected_chunk
+                                expected_size is not None
+                                and downloaded != expected_size
                             ):
                                 raise YouTubeRequestError(
-                                    "Media response length did not match "
-                                    "the server's range information. "
-                                    "Partial data has been preserved."
+                                    "Full response size mismatch."
                                 )
+
+                        else:
+                            raise YouTubeRequestError(
+                                f"Media download failed: HTTP {status}."
+                            )
 
                 except YouTubeExtractorError:
                     raise
 
-                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                except (
+                    httpx.TimeoutException,
+                    httpx.TransportError,
+                ) as exc:
                     raise YouTubeRequestError(
-                        f"Media download connection failed: {exc}"
+                        "Media download connection failed: "
+                        f"{type(exc).__name__}: {exc}"
                     ) from exc
 
                 if refresh_needed:
                     if refreshes >= max_url_refreshes:
                         raise YouTubeRestricted(
-                            "Media URL remained rejected after refresh."
+                            "Media URL rejected with HTTP 403/401 "
+                            f"after {refreshes} URL refreshes."
                         )
 
                     refreshes += 1
-                    info = await self.extract(video_id, force=True)
 
-                    selected = next(
-                        (
-                            item for item in info.get("formats", [])
-                            if item.get("itag") == itag
-                        ),
-                        None,
+                    info = await self.extract(
+                        video_id,
+                        options=options,
+                        force=True,
                     )
 
-                    if not selected or not selected.get("url"):
+                    selected = find_format(info)
+
+                    if not selected:
                         raise YouTubeUnavailable(
-                            "A refreshed direct URL is unavailable."
+                            "The format is unavailable after "
+                            "refreshing its media URL."
                         )
+
+                    refreshed_size = safe_int(
+                        selected.get("content_length")
+                    )
+
+                    if (
+                        refreshed_size is not None
+                        and refreshed_size > 0
+                    ):
+                        if (
+                            expected_size is not None
+                            and expected_size != refreshed_size
+                        ):
+                            raise YouTubeRequestError(
+                                "Media size changed after URL refresh."
+                            )
+
+                        expected_size = refreshed_size
 
                     continue
 
-                break
+                if (
+                    expected_size is not None
+                    and downloaded > expected_size
+                ):
+                    raise YouTubeRequestError(
+                        "Downloaded data exceeds expected size."
+                    )
 
-            if expected_size is not None and downloaded != expected_size:
+            if not part_path.is_file():
+                raise YouTubeRequestError(
+                    "Download produced no output file."
+                )
+
+            actual_size = part_path.stat().st_size
+
+            if actual_size != downloaded:
+                raise YouTubeRequestError(
+                    "Partial file size verification failed."
+                )
+
+            if (
+                expected_size is not None
+                and actual_size != expected_size
+            ):
                 raise YouTubeRequestError(
                     "Final download size verification failed. "
-                    "The partial file has been preserved."
+                    "Partial data has been preserved."
                 )
 
             part_path.replace(output_path)
@@ -1847,11 +1998,12 @@ class YouTubeExtractor:
                 "id": video_id,
                 "itag": itag,
                 "path": str(output_path),
-                "size": downloaded,
+                "size": actual_size,
                 "format": selected,
-                "resumed": bool(resume),
+                "resumed": initial_downloaded > 0,
                 "url_refreshes": refreshes,
             }
+                
 
     async def cache_stats(self) -> dict[str, Any]:
         return {
