@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import math
 import random
 import re
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Iterator
-from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -43,6 +41,8 @@ _MUSIC = "https://music.youtube.com"
 _SUGGEST_URL = "https://suggestqueries.google.com/complete/search"
 _DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
+# These are the filter tokens already used by the project. No speculative
+# Shorts/live/movie filter tokens are added.
 _FILTERS: dict[str, tuple[str | None, str]] = {
     "all": (None, "web"),
     "videos": ("EgIQAfABAQ==", "web"),
@@ -56,8 +56,14 @@ _FILTERS: dict[str, tuple[str | None, str]] = {
 }
 
 _CLIENTS = {
-    "web": {"name": "WEB", "id": "1", "version": "2.20261123.00.00", "url": _BASE},
-    "music": {"name": "WEB_REMIX", "id": "67", "version": "1.20260707.12.00", "url": _MUSIC},
+    "web": {
+        "name": "WEB", "id": "1",
+        "version": "2.20261123.00.00", "url": _BASE,
+    },
+    "music": {
+        "name": "WEB_REMIX", "id": "67",
+        "version": "1.20260707.12.00", "url": _MUSIC,
+    },
 }
 
 _RE_API_KEY = re.compile(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"')
@@ -70,16 +76,6 @@ _VIEWS_RE = re.compile(r"\b(?:views?|plays?)\b", re.I)
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _CURSOR_PREFIX = "yts:"
 
-_STOP_WORDS = frozenset({
-    "official", "video", "audio", "lyrics", "lyrical", "song", "songs",
-    "music", "hd", "4k", "remix", "status", "full", "visualizer",
-})
-_PENALTY_WORDS = frozenset({
-    "live", "cover", "karaoke", "slowed", "reverb", "sped", "nightcore",
-    "8d", "instrumental", "mashup", "reprise", "acoustic", "lofi",
-    "remix", "edit", "tribute", "parody", "reaction", "tutorial", "trailer",
-})
-# Do not skip menu/overlay: Music result IDs can be nested there.
 _SKIP_KEYS = frozenset({
     "trackingParams", "clickTrackingParams", "accessibility",
     "accessibilityData", "serviceEndpoints", "loggingDirectives",
@@ -135,12 +131,9 @@ def _number(value: str | None) -> int | None:
 
 
 def _duration(value: str | None) -> int | None:
-    if not value:
+    if not value or not _DURATION_RE.fullmatch(value.strip()):
         return None
-    value = value.strip()
-    if not _DURATION_RE.fullmatch(value):
-        return None
-    parts = [int(part) for part in value.split(":")]
+    parts = [int(part) for part in value.strip().split(":")]
     if any(part >= 60 for part in parts[1:]):
         return None
     total = 0
@@ -278,15 +271,23 @@ def _video(renderer: dict, source: str = "youtube") -> dict | None:
     labels = {label.strip().casefold() for label in badges}
     nav = renderer.get("navigationEndpoint")
     nav_url = _dig(nav, "commandMetadata", "webCommandMetadata", "url") or ""
+    title = _text(renderer.get("title"))
     return {
         "type": "video", "source": source, "id": video_id,
-        "title": _text(renderer.get("title")), "url": f"{_BASE}/watch?v={video_id}",
+        "title": title, "url": f"{_BASE}/watch?v={video_id}",
         "thumbnail": _thumbnail(renderer), "duration": duration_text,
         "duration_seconds": _duration(duration_text), "views": _number(view_text),
         "views_text": view_text, "published": _text(renderer.get("publishedTimeText")),
         "description": description, "badges": badges, **_channel_info(renderer),
-        "is_live": style == "LIVE" or bool(labels & {"live", "live now"}) or "watching" in (view_text or "").casefold(),
-        "is_short": style == "SHORTS" or (isinstance(nav, dict) and "reelWatchEndpoint" in nav) or nav_url.startswith("/shorts/"),
+        "is_live": (
+            style == "LIVE" or bool(labels & {"live", "live now"})
+            or "watching" in (view_text or "").casefold()
+        ),
+        "is_short": (
+            style == "SHORTS"
+            or (isinstance(nav, dict) and "reelWatchEndpoint" in nav)
+            or (isinstance(nav_url, str) and nav_url.startswith("/shorts/"))
+        ),
         "raw_type": "videoRenderer",
     }
 
@@ -315,7 +316,8 @@ def _channel(renderer: dict) -> dict | None:
         "thumbnail": _thumbnail(renderer), "handle": handle,
         "subscribers": subscribers, "subscribers_count": _number(subscribers),
         "video_count": video_count, "description": _text(renderer.get("descriptionSnippet")),
-        "badges": _badges(renderer), "verified": _is_verified(renderer), "raw_type": "channelRenderer",
+        "badges": _badges(renderer), "verified": _is_verified(renderer),
+        "raw_type": "channelRenderer",
     }
 
 
@@ -328,7 +330,11 @@ def _playlist(renderer: dict) -> dict | None:
         "type": "playlist", "id": playlist_id, "title": _text(renderer.get("title")),
         "url": f"{_BASE}/playlist?list={playlist_id}", "thumbnail": _thumbnail(renderer),
         "owner": _text(owner),
-        "video_count": _text(renderer.get("videoCountText")) or _text(renderer.get("videoCountShortText")) or _text(renderer.get("videoCount")),
+        "video_count": (
+            _text(renderer.get("videoCountText"))
+            or _text(renderer.get("videoCountShortText"))
+            or _text(renderer.get("videoCount"))
+        ),
         "raw_type": "playlistRenderer",
     }
 
@@ -348,8 +354,14 @@ def _lockup(renderer: dict) -> dict | None:
     return {
         "type": "playlist", "id": playlist_id, "title": _text(_dig(meta, "title")),
         "url": f"{_BASE}/playlist?list={playlist_id}",
-        "thumbnail": _pick_thumbnail(_dig(renderer, "contentImage", "collectionThumbnailViewModel", "primaryThumbnail", "thumbnailViewModel", "image", "sources")),
-        "owner": _text(_dig(meta, "metadata", "contentMetadataViewModel", "metadataRows", 0, "metadataParts", 0, "text")),
+        "thumbnail": _pick_thumbnail(_dig(
+            renderer, "contentImage", "collectionThumbnailViewModel",
+            "primaryThumbnail", "thumbnailViewModel", "image", "sources",
+        )),
+        "owner": _text(_dig(
+            meta, "metadata", "contentMetadataViewModel",
+            "metadataRows", 0, "metadataParts", 0, "text",
+        )),
         "video_count": count, "raw_type": "lockupViewModel",
     }
 
@@ -364,7 +376,7 @@ def _music_video_id(renderer: dict, title_cell: Any) -> str | None:
         _endpoint_video_id(renderer.get("overlay")),
         _endpoint_video_id(renderer.get("menu")),
     )
-    return next((value for value in candidates if isinstance(value, str) and _RE_ID.fullmatch(value)), None)
+    return next((v for v in candidates if isinstance(v, str) and _RE_ID.fullmatch(v)), None)
 
 
 def _music_item(renderer: dict) -> dict | None:
@@ -381,6 +393,7 @@ def _music_item(renderer: dict) -> dict | None:
     album = None
     duration = None
     extras: list[str] = []
+
     for run in runs or []:
         if not isinstance(run, dict):
             continue
@@ -416,7 +429,9 @@ def _music_item(renderer: dict) -> dict | None:
             "type": "song", "id": video_id, "title": title,
             "url": f"{_BASE}/watch?v={video_id}", "thumbnail": _thumbnail(renderer),
             "artists": [item["name"] for item in artists],
-            "album": album["name"] if album else None, "album_id": album["id"] if album else None,
+            "artist_ids": [item["id"] for item in artists],
+            "album": album["name"] if album else None,
+            "album_id": album["id"] if album else None,
             "duration": duration, "duration_seconds": _duration(duration),
             "views": views, "subtitle": subtitle,
             "channel_name": first_artist.get("name"), "channel_id": first_artist.get("id"),
@@ -432,29 +447,30 @@ def _music_item(renderer: dict) -> dict | None:
     if playlist_id:
         return {
             "type": "playlist", "id": playlist_id, "title": title,
-            "url": f"{_BASE}/playlist?list={playlist_id}", "thumbnail": _thumbnail(renderer),
-            "owner": first_artist.get("name"), "subtitle": subtitle,
-            "raw_type": "musicResponsiveListItemRenderer",
+            "url": f"{_BASE}/playlist?list={playlist_id}",
+            "thumbnail": _thumbnail(renderer), "owner": first_artist.get("name"),
+            "subtitle": subtitle, "raw_type": "musicResponsiveListItemRenderer",
         }
     if browse_id:
-        kind = "album" if browse_id.startswith("MPRE") else "artist" if browse_id.startswith(("UC", "MPLA")) else "music_entity"
+        kind = (
+            "album" if browse_id.startswith("MPRE")
+            else "artist" if browse_id.startswith(("UC", "MPLA"))
+            else "music_entity"
+        )
         return {
             "type": kind, "id": browse_id, "title": title,
             "url": f"{_MUSIC}/browse/{browse_id}", "thumbnail": _thumbnail(renderer),
             "artists": [item["name"] for item in artists],
-            "subscribers": next((value for value in extras if "subscriber" in value.casefold()), None),
+            "subscribers": next((v for v in extras if "subscriber" in v.casefold()), None),
             "subtitle": subtitle, "raw_type": "musicResponsiveListItemRenderer",
         }
     return None
 
 
 _HANDLERS = {
-    "videoRenderer": _video,
-    "gridVideoRenderer": _video,
-    "channelRenderer": _channel,
-    "gridChannelRenderer": _channel,
-    "playlistRenderer": _playlist,
-    "gridPlaylistRenderer": _playlist,
+    "videoRenderer": _video, "gridVideoRenderer": _video,
+    "channelRenderer": _channel, "gridChannelRenderer": _channel,
+    "playlistRenderer": _playlist, "gridPlaylistRenderer": _playlist,
     "lockupViewModel": _lockup,
     "musicResponsiveListItemRenderer": _music_item,
 }
@@ -465,6 +481,7 @@ def _parse(data: dict) -> tuple[list[dict], str | None, str | None]:
     seen: set[tuple[str, str]] = set()
     token = corrected = None
     stack: list[Any] = [data]
+
     while stack:
         node = stack.pop()
         if isinstance(node, tuple):
@@ -479,8 +496,9 @@ def _parse(data: dict) -> tuple[list[dict], str | None, str | None]:
                     seen.add(identity)
                     results.append(item)
             continue
+
         if isinstance(node, list):
-            stack.extend(value for value in reversed(node) if isinstance(value, (dict, list)))
+            stack.extend(v for v in reversed(node) if isinstance(v, (dict, list)))
             continue
         if not isinstance(node, dict):
             continue
@@ -506,6 +524,7 @@ def _parse(data: dict) -> tuple[list[dict], str | None, str | None]:
             handler = _HANDLERS.get(key)
             children.append((handler, value) if handler and isinstance(value, dict) else value)
         stack.extend(reversed(children))
+
     return results, token, corrected
 
 
@@ -513,60 +532,6 @@ def _normalise(value: str | None) -> str:
     if not value:
         return ""
     return " ".join(_WORD_RE.findall(value.casefold().replace("&", " and ")))
-
-
-def _query_tokens(query: str) -> set[str]:
-    return {word for word in _normalise(query).split() if len(word) > 1 and word not in _STOP_WORDS}
-
-
-def _similarity(a: str, b: str) -> float:
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    return SequenceMatcher(None, a, b, autojunk=False).ratio()
-
-
-def _rank_songs(items: list[dict], query: str) -> list[dict]:
-    q = _normalise(query)
-    q_all = set(q.split())
-    q_tokens = _query_tokens(query)
-    if not q or not q_tokens:
-        return items
-
-    scored = []
-    for index, item in enumerate(items):
-        title = _normalise(item.get("title"))
-        if not title:
-            scored.append((-5.0 - index * 0.02, index, item))
-            continue
-        title_tokens = set(title.split())
-        artists = [_normalise(name) for name in item.get("artists") or []]
-        artist_tokens = {word for name in artists for word in name.split()}
-        extra_tokens = set(_normalise(item.get("album")).split()) | set(_normalise(item.get("subtitle")).split())
-        all_tokens = title_tokens | artist_tokens | extra_tokens
-
-        title_coverage = len(q_tokens & title_tokens) / len(q_tokens)
-        broad_coverage = len(q_tokens & all_tokens) / len(q_tokens)
-        exact = float(q == title)
-        phrase = float(q in title)
-        artist_hit = float(any(name and set(name.split()) <= q_all for name in artists))
-        score = (
-            exact * 8.0 + phrase * 3.0 + title_coverage * 3.0
-            + broad_coverage * 0.8 + _similarity(q, title) * 0.8
-            + artist_hit * 0.7 - index * 0.018
-        )
-        penalties = len((title_tokens & _PENALTY_WORDS) - q_all)
-        score -= min(penalties, 2) * 1.2
-        seconds = item.get("duration_seconds")
-        if seconds is not None and (seconds < 45 or seconds > 720):
-            score -= 0.7
-        views = item.get("views")
-        if isinstance(views, (int, float)) and views > 0:
-            score += min(0.25, 0.04 * math.log10(views + 1))
-        scored.append((score, index, item))
-    scored.sort(key=lambda row: (-row[0], row[1]))
-    return [row[2] for row in scored]
 
 
 def _song_key(item: dict) -> tuple[str, str]:
@@ -579,6 +544,42 @@ def _clone(items: list[dict]) -> list[dict]:
         {key: list(value) if isinstance(value, list) else value for key, value in item.items()}
         for item in items
     ]
+
+
+def detect_filter(query: str) -> str:
+    """Infer the most useful existing YouTube filter from a query.
+
+    Shorts/live/movie intent maps to the existing videos filter; it does not
+    pretend that those are dedicated Innertube filter categories.
+    """
+    if not isinstance(query, str):
+        raise ValueError("query must be a string")
+    words = set(_normalise(query).split())
+    if not words:
+        return "all"
+
+    if words & {"playlist", "playlists", "mix", "compilation"}:
+        return "playlists"
+    if words & {"album", "albums", "ep"}:
+        return "albums"
+    if words & {"artist", "artists"}:
+        return "artists"
+    if words & {"channel", "channels", "creator", "creators", "youtuber"}:
+        return "channels"
+
+    if words & {"short", "shorts", "live", "livestream", "concert", "stream"}:
+        return "videos"
+    if words & {
+        "song", "songs", "music", "audio", "lyrics", "lyrical",
+        "soundtrack", "ost", "bgm", "singer", "singers",
+    }:
+        return "songs"
+    if words & {
+        "video", "videos", "trailer", "trailers", "movie", "movies",
+        "film", "films", "teaser",
+    }:
+        return "videos"
+    return "all"
 
 
 class _TTLCache:
@@ -613,13 +614,13 @@ class _TTLCache:
 
     def stats(self) -> dict:
         now = time.monotonic()
-        for key in [key for key, (deadline, _) in self.data.items() if deadline <= now]:
+        for key in [k for k, (deadline, _) in self.data.items() if deadline <= now]:
             self.data.pop(key, None)
         return {"size": len(self.data), "maxsize": self.maxsize, "ttl": self.ttl}
 
 
 class YouTubeSearch:
-    """Async public YouTube / YouTube Music search client."""
+    """Async YouTube and YouTube Music search client with bounded caching."""
 
     _CONFIG_TTL = 3600.0
     _MAX_PAGES = 5
@@ -650,6 +651,7 @@ class YouTubeSearch:
             raise ValueError("country must be a non-empty string")
 
         self.timeout = float(timeout)
+        self.concurrency = concurrency
         self.retries = max(0, retries)
         self.language = language.strip()
         self.country = country.strip().upper()
@@ -718,7 +720,7 @@ class YouTubeSearch:
         await self.close()
 
     async def warmup(self) -> None:
-        """Load config only; never run a fake search query."""
+        """Warm public YouTube client configuration without a fake search."""
         if self._closed:
             raise YouTubeSearchError("Client is closed.")
         await self._get_config("web")
@@ -734,8 +736,6 @@ class YouTubeSearch:
         if not force and cached and cached[0] > time.monotonic():
             return cached[1]
 
-        # Music uses WEB's public key + visitor data, as in the deadlock-fixed
-        # repository implementation. Locks are per-site, never recursively held.
         if site == "music":
             web_config = await self._get_config("web", force=force)
             async with self._config_locks["music"]:
@@ -762,17 +762,19 @@ class YouTubeSearch:
                 )
                 response.raise_for_status()
             except httpx.HTTPError as exc:
-                raise YouTubeSearchError(f"YouTube configuration request failed: {exc}") from exc
+                raise YouTubeSearchError(
+                    f"YouTube configuration request failed: {exc}"
+                ) from exc
             html = response.text
-            api_key = _RE_API_KEY.search(html)
-            version = _RE_VERSION.search(html)
-            visitor = _RE_VISITOR.search(html)
-            if not api_key:
+            api_key_match = _RE_API_KEY.search(html)
+            version_match = _RE_VERSION.search(html)
+            visitor_match = _RE_VISITOR.search(html)
+            if not api_key_match:
                 raise YouTubeSearchError("Could not find YouTube Innertube API key.")
             config = {
-                "api_key": api_key.group(1),
-                "version": version.group(1) if version else spec["version"],
-                "visitor": visitor.group(1) if visitor else None,
+                "api_key": api_key_match.group(1),
+                "version": version_match.group(1) if version_match else spec["version"],
+                "visitor": visitor_match.group(1) if visitor_match else None,
             }
             self._configs["web"] = (time.monotonic() + self._CONFIG_TTL, config)
             return config
@@ -798,7 +800,9 @@ class YouTubeSearch:
                 raise YouTubeSearchError("Client is closed.")
             try:
                 async with self.semaphore:
-                    response = await self.client.post(url, params=params, json=body, headers=headers)
+                    response = await self.client.post(
+                        url, params=params, json=body, headers=headers
+                    )
             except httpx.RequestError as exc:
                 last_error = exc
                 if attempt < self.retries:
@@ -823,22 +827,28 @@ class YouTubeSearch:
             return data
         raise YouTubeSearchError(f"YouTube request failed: {last_error}") from last_error
 
-    async def _send(self, query: str, filter_name: str, continuation: str | None) -> dict:
+    async def _send(
+        self, query: str, filter_name: str, continuation: str | None
+    ) -> dict:
         search_params, site = _FILTERS[filter_name]
         spec = _CLIENTS[site]
         config = await self._get_config(site)
         client_context = {
-            "clientName": spec["name"], "clientVersion": config["version"],
-            "hl": self.language, "gl": self.country,
+            "clientName": spec["name"],
+            "clientVersion": config["version"],
+            "hl": self.language,
+            "gl": self.country,
         }
         headers = {
-            "Origin": spec["url"], "Referer": spec["url"] + "/",
+            "Origin": spec["url"],
+            "Referer": spec["url"] + "/",
             "X-Youtube-Client-Name": spec["id"],
             "X-Youtube-Client-Version": config["version"],
         }
         if config.get("visitor"):
             client_context["visitorData"] = config["visitor"]
             headers["X-Goog-Visitor-Id"] = config["visitor"]
+
         params = {"prettyPrint": "false", "key": config["api_key"]}
         body: dict[str, Any] = {"context": {"client": client_context, "user": {}}}
         if continuation:
@@ -850,9 +860,14 @@ class YouTubeSearch:
             body["query"] = query
             if search_params:
                 body["params"] = search_params
-        return await self._post(f"{spec['url']}/youtubei/v1/search", body, params, headers)
 
-    async def _request(self, query: str, *, filter_name: str, continuation: str | None = None) -> dict:
+        return await self._post(
+            f"{spec['url']}/youtubei/v1/search", body, params, headers
+        )
+
+    async def _request(
+        self, query: str, *, filter_name: str, continuation: str | None = None
+    ) -> dict:
         if self._closed:
             raise YouTubeSearchError("Client is closed.")
         site = _FILTERS[filter_name][1]
@@ -861,27 +876,42 @@ class YouTubeSearch:
         except _HttpStatusError as exc:
             if exc.status not in (400, 403):
                 raise
-            # Refresh only once. Music refresh safely refreshes WEB first.
             await self._get_config(site, force=True)
             return await self._send(query, filter_name, continuation)
 
-    async def _fetch_page(self, query: str, filter_name: str, continuation: str | None = None):
-        return _parse(await self._request(query, filter_name=filter_name, continuation=continuation))
+    async def _fetch_page(
+        self, query: str, filter_name: str, continuation: str | None = None
+    ):
+        return _parse(
+            await self._request(
+                query, filter_name=filter_name, continuation=continuation
+            )
+        )
 
     async def _first_page(self, query: str, filter_name: str):
-        key = (" ".join(query.split()).casefold(), filter_name, self.language, self.country)
+        key = (
+            " ".join(query.split()).casefold(),
+            filter_name, self.language, self.country,
+        )
         cached = self.cache.get(key)
         if cached is not None:
             items, token, corrected = cached
             return _clone(items), token, corrected
+
         async with self._inflight_lock:
             if self._closed:
                 raise YouTubeSearchError("Client is closed.")
             task = self.inflight.get(key)
             if task is None:
-                task = asyncio.create_task(self._load_first(key, query, filter_name))
+                task = asyncio.create_task(
+                    self._load_first(key, query, filter_name)
+                )
                 self.inflight[key] = task
-                task.add_done_callback(lambda current, cache_key=key: self._forget(cache_key, current))
+                task.add_done_callback(
+                    lambda current, cache_key=key:
+                    self._forget(cache_key, current)
+                )
+
         items, token, corrected = await asyncio.shield(task)
         return _clone(items), token, corrected
 
@@ -913,9 +943,14 @@ class YouTubeSearch:
             "configs": len(self._configs),
         }
 
-    def _stash(self, token: str | None, leftover: list[dict], seen_ids: set, seen_songs: set) -> str:
+    def _stash(
+        self, token: str | None, leftover: list[dict],
+        seen_ids: set, seen_songs: set,
+    ) -> str:
         cursor = _CURSOR_PREFIX + uuid.uuid4().hex
-        self._leftovers.set(cursor, (token, _clone(leftover), set(seen_ids), set(seen_songs)))
+        self._leftovers.set(
+            cursor, (token, _clone(leftover), set(seen_ids), set(seen_songs))
+        )
         return cursor
 
     def _resume(self, cursor: str):
@@ -943,11 +978,18 @@ class YouTubeSearch:
         if not isinstance(filter, str):
             raise ValueError("filter must be a string")
         filter = filter.lower().strip()
+        if filter == "auto":
+            filter = detect_filter(query)
         if filter not in _FILTERS:
-            raise ValueError(f"Unsupported filter: {filter}. Available: {', '.join(_FILTERS)}")
+            raise ValueError(
+                f"Unsupported filter: {filter}. "
+                f"Available: auto, {', '.join(_FILTERS)}"
+            )
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
-        if continuation is not None and (not isinstance(continuation, str) or not continuation):
+        if continuation is not None and (
+            not isinstance(continuation, str) or not continuation
+        ):
             raise ValueError("continuation must be a non-empty string or None")
 
         query = " ".join(query.split())
@@ -972,11 +1014,10 @@ class YouTubeSearch:
                     pool.append(item)
 
         add(items)
-
-        # Do not fetch extra pages just to pad the first search. Only continue
-        # when the requested limit cannot be satisfied by the current page.
         pages = 1
         seen_tokens: set[str] = set()
+
+        # Fetch only when the current accumulated page cannot satisfy limit.
         while len(pool) < limit and token and pages < self._MAX_PAGES:
             if token in seen_tokens:
                 token = None
@@ -990,9 +1031,8 @@ class YouTubeSearch:
                 token = None
                 break
 
+        # Preserve YouTube's native ordering; only remove duplicate songs.
         if is_songs:
-            if not continuation and len(pool) > 1:
-                pool = _rank_songs(pool, query)
             local_song_keys = set(seen_songs)
             unique = []
             for item in pool:
@@ -1012,26 +1052,41 @@ class YouTubeSearch:
                 seen_songs.add(_song_key(item))
 
         if not results and not continuation and is_songs and fallback:
-            result = await self.search(query, filter="videos", limit=limit, fallback=False)
+            result = await self.search(
+                query, filter="videos", limit=limit, fallback=False
+            )
             result["fallback_from"] = "songs"
             return result
 
-        cursor = self._stash(token, leftover, seen_ids, seen_songs) if (leftover or token) else None
+        cursor = (
+            self._stash(token, leftover, seen_ids, seen_songs)
+            if leftover or token else None
+        )
         return {
-            "query": query, "filter": filter, "results": results,
-            "continuation": cursor, "has_more": bool(cursor),
-            "count": len(results), "corrected_query": corrected,
+            "query": query,
+            "filter": filter,
+            "results": results,
+            "continuation": cursor,
+            "has_more": bool(cursor),
+            "count": len(results),
+            "corrected_query": corrected,
         }
 
-    async def next_page(self, previous_result: dict, *, limit: int = 20) -> dict:
+    async def next_page(
+        self, previous_result: dict, *, limit: int = 20
+    ) -> dict:
         if not isinstance(previous_result, dict):
             raise ValueError("previous_result must be a dictionary")
         token = previous_result.get("continuation")
         if not token:
             return {
-                "query": previous_result.get("query"), "filter": previous_result.get("filter"),
-                "results": [], "continuation": None, "has_more": False,
-                "count": 0, "corrected_query": None,
+                "query": previous_result.get("query"),
+                "filter": previous_result.get("filter"),
+                "results": [],
+                "continuation": None,
+                "has_more": False,
+                "count": 0,
+                "corrected_query": None,
             }
         return await self.search(
             previous_result.get("query", ""),
@@ -1040,15 +1095,99 @@ class YouTubeSearch:
             continuation=token,
         )
 
-    async def search_many(self, queries: list[str], *, filter: str = "all", limit: int = 20):
-        outcomes = await asyncio.gather(
-            *(self.search(query, filter=filter, limit=limit) for query in queries),
-            return_exceptions=True,
+    async def search_many(
+        self,
+        queries: list[str],
+        *,
+        filter: str = "auto",
+        limit: int = 20,
+        concurrency: int | None = None,
+    ) -> list[dict]:
+        if self._closed:
+            raise YouTubeSearchError("Client is closed.")
+        if not isinstance(queries, list):
+            raise ValueError("queries must be a list")
+        if not isinstance(filter, str):
+            raise ValueError("filter must be a string")
+        workers = self.concurrency if concurrency is None else concurrency
+        if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+            raise ValueError("concurrency must be an integer >= 1")
+
+        gate = asyncio.Semaphore(workers)
+        output: list[dict | None] = [None] * len(queries)
+
+        async def run(index: int, value: str):
+            async with gate:
+                try:
+                    selected = (
+                        detect_filter(value)
+                        if filter.strip().lower() == "auto"
+                        else filter.strip().lower()
+                    )
+                    output[index] = await self.search(
+                        value, filter=selected, limit=limit
+                    )
+                except (YouTubeSearchError, ValueError) as exc:
+                    output[index] = {
+                        "query": value if isinstance(value, str) else None,
+                        "error": str(exc),
+                    }
+
+        await asyncio.gather(*(run(i, q) for i, q in enumerate(queries)))
+        return [item for item in output if item is not None]
+
+    async def search_multi(
+        self,
+        query: str,
+        *,
+        filters: list[str] | None = None,
+        limit: int = 10,
+        concurrency: int = 4,
+    ) -> dict:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        selected = list(dict.fromkeys(filters or [
+            "videos", "songs", "channels", "playlists",
+        ]))
+        invalid = [name for name in selected if name not in _FILTERS]
+        if invalid:
+            raise ValueError(f"Unsupported filters: {invalid}")
+        if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+            raise ValueError("concurrency must be an integer >= 1")
+
+        gate = asyncio.Semaphore(concurrency)
+
+        async def run(name: str):
+            async with gate:
+                try:
+                    return name, await self.search(query, filter=name, limit=limit)
+                except (YouTubeSearchError, ValueError) as exc:
+                    return name, {
+                        "query": query, "filter": name,
+                        "results": [], "count": 0, "error": str(exc),
+                    }
+
+        pairs = await asyncio.gather(*(run(name) for name in selected))
+        return {"query": query, "sections": dict(pairs)}
+
+    async def search_sections(
+        self, query: str, *, limit: int = 10
+    ) -> dict:
+        return await self.search_multi(
+            query,
+            filters=[
+                "videos", "songs", "albums", "artists",
+                "channels", "playlists",
+            ],
+            limit=limit,
         )
-        return [
-            outcome if isinstance(outcome, (dict, YouTubeSearchError)) else _raise(outcome)
-            for outcome in outcomes
-        ]
+
+    async def search_auto(
+        self, query: str, *, limit: int = 20, fallback: bool = True
+    ) -> dict:
+        return await self.search(
+            query, filter="auto", limit=limit, fallback=fallback
+        )
 
     async def suggest(self, query: str, *, limit: int = 10) -> list[str]:
         if self._closed:
@@ -1062,27 +1201,39 @@ class YouTubeSearch:
         cached = self._suggest_cache.get(key)
         if cached is not None:
             return list(cached[:limit])
+
         try:
             async with self.semaphore:
                 response = await self.client.get(
                     _SUGGEST_URL,
                     params={
-                        "client": "firefox", "ds": "yt", "hl": self.language,
-                        "oe": "utf-8", "q": query,
+                        "client": "firefox", "ds": "yt",
+                        "hl": self.language, "oe": "utf-8", "q": query,
                     },
                 )
                 response.raise_for_status()
         except httpx.HTTPError as exc:
-            raise YouTubeSearchError(f"Suggestion request failed: {exc}") from exc
+            raise YouTubeSearchError(
+                f"Suggestion request failed: {exc}"
+            ) from exc
+
         try:
             data = _loads(response.content)
         except (ValueError, TypeError) as exc:
-            raise YouTubeSearchError("Suggestion response was not valid JSON.") from exc
-        raw = data[1] if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list) else []
+            raise YouTubeSearchError(
+                "Suggestion response was not valid JSON."
+            ) from exc
+
+        raw = (
+            data[1] if isinstance(data, list) and len(data) > 1
+            and isinstance(data[1], list) else []
+        )
         suggestions = []
+        seen = set()
         for entry in raw:
             value = entry[0] if isinstance(entry, list) and entry else entry
-            if isinstance(value, str) and value and value not in suggestions:
+            if isinstance(value, str) and value and value not in seen:
+                seen.add(value)
                 suggestions.append(value)
         self._suggest_cache.set(key, suggestions)
         return suggestions[:limit]
@@ -1108,12 +1259,31 @@ class YouTubeSearch:
     async def search_playlists(self, query: str, *, limit: int = 20):
         return await self.search(query, filter="playlists", limit=limit)
 
+    async def search_movies(self, query: str, *, limit: int = 20):
+        # YouTube does not expose a validated separate Movies filter here.
+        return await self.search(query, filter="videos", limit=limit)
+
+    async def search_shorts(self, query: str, *, limit: int = 20):
+        # Shorts are locally selected from returned video metadata. This is
+        # not a dedicated server-side Shorts filter.
+        result = await self.search(query, filter="videos", limit=min(100, max(limit * 3, limit)))
+        result["results"] = [
+            item for item in result["results"] if item.get("is_short")
+        ][:limit]
+        result["count"] = len(result["results"])
+        return result
+
+    async def search_live(self, query: str, *, limit: int = 20):
+        # Live is selected from live metadata, not a fabricated filter token.
+        result = await self.search(query, filter="videos", limit=min(100, max(limit * 3, limit)))
+        result["results"] = [
+            item for item in result["results"] if item.get("is_live")
+        ][:limit]
+        result["count"] = len(result["results"])
+        return result
+
     async def ytsearch(self, query: str, *, limit: int = 20):
         return await self.search(query, limit=limit)
 
 
-def _raise(exc: BaseException):
-    raise exc
-
-
-__all__ = ["YouTubeSearch", "YouTubeSearchError"]
+__all__ = ["YouTubeSearch", "YouTubeSearchError", "detect_filter"]
