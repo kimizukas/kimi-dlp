@@ -1866,3 +1866,14 @@ class YouTubeExtractor:
             self.playlist_cache.clear(),
             self.stream_cache.clear(),
         )
+
+
+__all__ = [
+    "YouTubeExtractorError",
+    "YouTubeUnavailable",
+    "YouTubeRestricted",
+    "YouTubeRequestError",
+    "YouTubeOptions",
+    "TTLCache",
+    "YouTubeExtractor",
+]
