@@ -1,8 +1,8 @@
 
-
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 import time
@@ -12,12 +12,33 @@ from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
+# Mandatory compiled extension. No Python fallback.
+try:
+    from .youtube_core import (
+        is_video_id,
+        parse_content_range,
+        parse_unsatisfied_range,
+        safe_int,
+        text_value,
+        format_sort_key,
+        normalize_content_length,
+        calculate_range,
+        deduplicate_ids,
+    )
+except ImportError as exc:
+    raise ImportError(
+        "The compiled kimi.extractor.youtube_core extension is required. "
+        "Build it with: python setup.py build_ext --inplace"
+    ) from exc
+
 
 _BASE = "https://www.youtube.com"
+_PLAYER_URL = f"{_BASE}/youtubei/v1/player"
+_BROWSE_URL = f"{_BASE}/youtubei/v1/browse"
 
 _ANDROID_VERSION = "20.10.38"
 _WEB_VERSION = "2.20261123.00.00"
@@ -37,40 +58,60 @@ _DEFAULT_API_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _PLAYLIST_RE = re.compile(r"^[A-Za-z0-9_-]{10,128}$")
-
-_API_KEY_RE = re.compile(
-    r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"'
-)
-
+_API_KEY_RE = re.compile(r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"')
 _VERSION_RE = re.compile(
     r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"'
 )
 
-_CONTENT_RANGE_RE = re.compile(
-    r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
-    re.IGNORECASE,
-)
+_TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504}
+
+_RESTRICTED_STATUSES = {
+    "LOGIN_REQUIRED",
+    "AGE_CHECK_REQUIRED",
+    "CONTENT_CHECK_REQUIRED",
+    "AGE_VERIFICATION_REQUIRED",
+}
+
+_UNAVAILABLE_STATUSES = {
+    "ERROR",
+    "LIVE_STREAM_OFFLINE",
+    "UNPLAYABLE",
+    "VIDEO_UNAVAILABLE",
+    "COPYRIGHT",
+}
 
 _PLAYER_CLIENTS = (
-    ("ANDROID", _ANDROID_VERSION, _ANDROID_UA),
-    ("WEB", _WEB_VERSION, _WEB_UA),
+    {
+        "name": "ANDROID",
+        "version": _ANDROID_VERSION,
+        "user_agent": _ANDROID_UA,
+        "client_id": "3",
+        "priority": 0,
+    },
+    {
+        "name": "WEB",
+        "version": _WEB_VERSION,
+        "user_agent": _WEB_UA,
+        "client_id": "1",
+        "priority": 1,
+    },
 )
 
 
 class YouTubeExtractorError(Exception):
-    """Base extractor error."""
+    """Base extractor exception."""
 
 
 class YouTubeUnavailable(YouTubeExtractorError):
-    """Video or playlist is unavailable."""
+    """The requested video or playlist is unavailable."""
 
 
 class YouTubeRestricted(YouTubeExtractorError):
-    """Authentication or verification is required."""
+    """The requested content requires authentication or verification."""
 
 
 class YouTubeRequestError(YouTubeExtractorError):
-    """Network or HTTP request failed."""
+    """HTTP, network, or response parsing error."""
 
 
 @dataclass(slots=True)
@@ -82,8 +123,8 @@ class YouTubeOptions:
     tags: bool = True
     chapters: bool = True
     captions: bool = True
-
     automatic_captions: bool = False
+
     watch_playlist: bool = True
     related_videos: bool = False
     raw_response: bool = False
@@ -98,16 +139,10 @@ class YouTubeOptions:
     retries: int = 2
     timeout: float = 12.0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.retries = max(0, min(int(self.retries), 5))
-        self.playlist_limit = max(
-            1,
-            min(int(self.playlist_limit), 500),
-        )
-        self.timeout = max(
-            3.0,
-            min(float(self.timeout), 60.0),
-        )
+        self.playlist_limit = max(1, min(int(self.playlist_limit), 500))
+        self.timeout = max(3.0, min(float(self.timeout), 60.0))
 
 
 @dataclass(slots=True)
@@ -119,11 +154,7 @@ class CacheEntry:
 class TTLCache:
     """Bounded asynchronous LRU cache with TTL and request de-duplication."""
 
-    def __init__(
-        self,
-        maxsize: int = 512,
-        ttl: int = 21600,
-    ):
+    def __init__(self, maxsize: int = 512, ttl: int = 21600):
         self.maxsize = max(1, int(maxsize))
         self.ttl = max(1, int(ttl))
 
@@ -135,15 +166,15 @@ class TTLCache:
         self.misses = 0
         self.expired = 0
 
-    async def get(self, key: str):
+    async def get(self, key: str) -> Any:
         async with self._lock:
-            item = self._data.get(key)
+            entry = self._data.get(key)
 
-            if item is None:
+            if entry is None:
                 self.misses += 1
                 return None
 
-            if item.expires <= time.monotonic():
+            if entry.expires <= time.monotonic():
                 self._data.pop(key, None)
                 self.expired += 1
                 self.misses += 1
@@ -151,32 +182,32 @@ class TTLCache:
 
             self._data.move_to_end(key)
             self.hits += 1
-            return item.value
+            return copy.deepcopy(entry.value)
 
     async def put(
         self,
         key: str,
         value: Any,
         ttl: int | None = None,
-    ):
-        lifetime = (
-            self.ttl
-            if ttl is None
-            else max(1, int(ttl))
-        )
+    ) -> None:
+        lifetime = self.ttl if ttl is None else max(1, int(ttl))
 
         async with self._lock:
             self._data[key] = CacheEntry(
-                value=value,
+                value=copy.deepcopy(value),
                 expires=time.monotonic() + lifetime,
             )
-
             self._data.move_to_end(key)
 
             while len(self._data) > self.maxsize:
                 self._data.popitem(last=False)
 
-    async def _produce(self, key, factory, ttl):
+    async def _produce(
+        self,
+        key: str,
+        factory,
+        ttl: int | None,
+    ) -> Any:
         try:
             result = await factory()
             await self.put(key, result, ttl)
@@ -191,9 +222,8 @@ class TTLCache:
         key: str,
         factory,
         ttl: int | None = None,
-    ):
+    ) -> Any:
         cached = await self.get(key)
-
         if cached is not None:
             return cached
 
@@ -206,20 +236,20 @@ class TTLCache:
                 )
                 self._inflight[key] = task
 
-        return await asyncio.shield(task)
+        return copy.deepcopy(await asyncio.shield(task))
 
-    async def clear(self):
+    async def clear(self) -> None:
         async with self._lock:
             self._data.clear()
 
-    async def stats(self):
+    async def stats(self) -> dict[str, int]:
         async with self._lock:
             now = time.monotonic()
 
             return {
                 "entries": sum(
-                    item.expires > now
-                    for item in self._data.values()
+                    entry.expires > now
+                    for entry in self._data.values()
                 ),
                 "inflight": len(self._inflight),
                 "hits": self.hits,
@@ -232,21 +262,10 @@ class TTLCache:
 
 class YouTubeExtractor:
     """
-    Lightweight asynchronous YouTube extractor.
+    Async YouTube metadata, format, playlist and media extractor.
 
-    Metadata cache:
-        Configurable, default 6 hours.
-
-    Playlist cache:
-        Configurable, default 6 hours.
-
-    Stream URL cache:
-        Configurable, default 5 minutes.
-
-    Android player is preferred.
-    WEB player is the fallback.
-
-    Signed URLs are not treated as permanent metadata.
+    Network operations use httpx.
+    CPU-oriented parsing helpers use the mandatory Cython extension.
     """
 
     def __init__(
@@ -260,30 +279,49 @@ class YouTubeExtractor:
         metadata_ttl: int = 21600,
         stream_ttl: int = 300,
         client: httpx.AsyncClient | None = None,
+        max_connections: int = 20,
+        max_keepalive_connections: int = 10,
+        request_concurrency: int = 8,
+        download_concurrency: int = 3,
+        po_token: str | None = None,
+        options: YouTubeOptions | None = None,
     ):
+        self.options = options or YouTubeOptions(timeout=timeout)
         self.api_key = api_key or _DEFAULT_API_KEY
-        self._external_client = client is not None
+        self._api_key = self.api_key
+        self._client_version = _WEB_VERSION
 
-        self.timeout = max(
-            3.0,
-            min(float(timeout), 60.0),
-        )
+        self.timeout = max(3.0, min(float(timeout), 60.0))
+        self.po_token = po_token.strip() if po_token else None
+
+        self._external_client = client is not None
+        self._closed = False
 
         if client is not None:
             self.client = client
         else:
+            max_connections = max(1, int(max_connections))
+            keepalive = max(
+                1,
+                min(int(max_keepalive_connections), max_connections),
+            )
+
             self.client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout),
+                timeout=httpx.Timeout(
+                    self.timeout,
+                    connect=min(self.timeout, 10.0),
+                ),
                 follow_redirects=True,
                 proxy=proxy,
                 limits=httpx.Limits(
-                    max_connections=20,
-                    max_keepalive_connections=10,
+                    max_connections=max_connections,
+                    max_keepalive_connections=keepalive,
                     keepalive_expiry=30.0,
                 ),
                 headers={
                     "User-Agent": _WEB_UA,
                     "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate",
                 },
                 cookies=self._load_cookies(cookies),
             )
@@ -292,53 +330,57 @@ class YouTubeExtractor:
             cache_size,
             metadata_ttl,
         )
-
         self.playlist_cache = TTLCache(
             max(32, cache_size // 4),
             metadata_ttl,
         )
-
         self.stream_cache = TTLCache(
             cache_size,
             stream_ttl,
         )
 
-        self._api_key = self.api_key
-        self._client_version = _WEB_VERSION
-
         self._bootstrap_lock = asyncio.Lock()
         self._bootstrapped = False
 
-        self._request_semaphore = asyncio.Semaphore(8)
-        self._download_semaphore = asyncio.Semaphore(4)
+        self._request_semaphore = asyncio.Semaphore(
+            max(1, int(request_concurrency))
+        )
+        self._download_semaphore = asyncio.Semaphore(
+            max(1, int(download_concurrency))
+        )
 
     @staticmethod
     def _load_cookies(cookie_file: str | None):
         if not cookie_file:
             return None
 
+        path = Path(cookie_file).expanduser()
+
+        if not path.is_file():
+            raise YouTubeExtractorError(
+                f"Cookie file does not exist: {path}"
+            )
+
         cookies = httpx.Cookies()
 
         try:
-            with open(cookie_file, encoding="utf-8") as file:
+            with path.open("r", encoding="utf-8") as file:
                 for raw_line in file:
-                    line = raw_line.strip()
+                    line = raw_line.rstrip("\r\n")
 
                     if not line:
                         continue
 
                     if line.startswith("#HttpOnly_"):
                         line = line[len("#HttpOnly_"):]
-
                     elif line.startswith("#"):
                         continue
 
                     parts = line.split("\t")
-
                     if len(parts) != 7:
                         continue
 
-                    domain, _, path, _, _, name, value = parts
+                    domain, _, cookie_path, _, _, name, value = parts
 
                     if not domain or not name:
                         continue
@@ -347,7 +389,7 @@ class YouTubeExtractor:
                         name,
                         value,
                         domain=domain,
-                        path=path or "/",
+                        path=cookie_path or "/",
                     )
 
         except OSError as exc:
@@ -357,53 +399,63 @@ class YouTubeExtractor:
 
         return cookies
 
-    async def close(self):
+    async def close(self) -> None:
+        if self._closed:
+            return
+
+        self._closed = True
+
         if not self._external_client:
             await self.client.aclose()
 
     async def __aenter__(self):
+        if self._closed:
+            raise YouTubeExtractorError("Extractor is already closed.")
         return self
 
     async def __aexit__(self, *_):
         await self.close()
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise YouTubeExtractorError("Extractor is closed.")
+
     @staticmethod
-    def _retry_delay(response, attempt: int):
-        retry_after = response.headers.get("Retry-After")
+    def _retry_delay(
+        response: httpx.Response | None,
+        attempt: int,
+    ) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
 
-        if retry_after:
-            try:
-                return min(
-                    15.0,
-                    max(0.0, float(retry_after)),
-                )
-            except ValueError:
+            if retry_after:
                 try:
-                    date = parsedate_to_datetime(retry_after)
-                    delay = date.timestamp() - time.time()
+                    return min(20.0, max(0.0, float(retry_after)))
+                except ValueError:
+                    try:
+                        date = parsedate_to_datetime(retry_after)
+                        delay = date.timestamp() - time.time()
+                        return min(20.0, max(0.0, delay))
+                    except (TypeError, ValueError, OverflowError):
+                        pass
 
-                    return min(
-                        15.0,
-                        max(0.0, delay),
-                    )
-                except (
-                    TypeError,
-                    ValueError,
-                    OverflowError,
-                ):
-                    pass
-
-        return min(0.4 * (2 ** attempt), 3.0)
+        return min(0.4 * (2 ** attempt), 4.0)
 
     async def _request(
         self,
         method: str,
         url: str,
         *,
-        options: YouTubeOptions | None = None,
-        **kwargs,
-    ):
-        retries = options.retries if options else 2
+        retries: int | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        self._ensure_open()
+
+        retries = (
+            self.options.retries
+            if retries is None
+            else max(0, min(int(retries), 5))
+        )
 
         async with self._request_semaphore:
             for attempt in range(retries + 1):
@@ -416,69 +468,63 @@ class YouTubeExtractor:
                         **kwargs,
                     )
 
-                    if response.status_code in (
-                        429,
-                        500,
-                        502,
-                        503,
-                        504,
-                    ):
-                        if attempt < retries:
-                            delay = self._retry_delay(
-                                response,
-                                attempt,
-                            )
+                    status = response.status_code
 
+                    if status in _TRANSIENT_HTTP:
+                        if attempt < retries:
+                            delay = self._retry_delay(response, attempt)
                             await response.aclose()
+                            response = None
                             await asyncio.sleep(delay)
                             continue
 
-                    if response.status_code in (401, 403):
-                        status = response.status_code
+                        body = response.text[:500]
                         await response.aclose()
-
-                        raise YouTubeRestricted(
-                            f"YouTube rejected the request "
-                            f"with HTTP {status}."
+                        response = None
+                        raise YouTubeRequestError(
+                            f"Transient HTTP {status}: {body}"
                         )
 
-                    response.raise_for_status()
+                    if status in (401, 403):
+                        body = response.text[:500]
+                        await response.aclose()
+                        response = None
+                        raise YouTubeRestricted(
+                            f"YouTube rejected the request "
+                            f"(HTTP {status}): {body}"
+                        )
+
+                    if status >= 400:
+                        body = response.text[:500]
+                        await response.aclose()
+                        response = None
+                        raise YouTubeRequestError(
+                            f"HTTP {status}: {body}"
+                        )
+
+                    # Caller owns and must close a successful response.
                     return response
 
                 except YouTubeExtractorError:
                     raise
 
-                except httpx.HTTPStatusError as exc:
-                    raise YouTubeRequestError(
-                        f"YouTube HTTP error: "
-                        f"{exc.response.status_code}"
-                    ) from exc
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    if response is not None:
+                        await response.aclose()
 
-                except (
-                    httpx.TimeoutException,
-                    httpx.TransportError,
-                ) as exc:
                     if attempt >= retries:
                         raise YouTubeRequestError(
-                            f"YouTube network error: "
-                            f"{type(exc).__name__}"
+                            f"Request failed after {attempt + 1} attempts: "
+                            f"{type(exc).__name__}: {exc}"
                         ) from exc
 
                     await asyncio.sleep(
-                        min(0.3 * (2 ** attempt), 2.0)
+                        self._retry_delay(None, attempt)
                     )
-
-                finally:
-                    if (
-                        response is not None
-                        and response.is_closed is False
-                        and response.status_code >= 400
-                    ):
-                        await response.aclose()
 
         raise YouTubeRequestError("Request failed.")
 
-    async def _bootstrap(self):
+    async def _bootstrap(self) -> None:
         if self._bootstrapped:
             return
 
@@ -487,37 +533,35 @@ class YouTubeExtractor:
                 return
 
             try:
-                response = await self._request(
-                    "GET",
-                    _BASE,
-                )
+                response = await self._request("GET", _BASE)
 
                 try:
                     page = response.text
                 finally:
                     await response.aclose()
 
-                key = _API_KEY_RE.search(page)
-                version = _VERSION_RE.search(page)
+                key_match = _API_KEY_RE.search(page)
+                version_match = _VERSION_RE.search(page)
 
-                if key:
-                    self._api_key = key.group(1)
+                if key_match:
+                    self._api_key = key_match.group(1)
 
-                if version:
-                    self._client_version = version.group(1)
+                if version_match:
+                    self._client_version = version_match.group(1)
 
             except YouTubeExtractorError:
-                # Use configured defaults when bootstrap is unavailable.
+                # Configured defaults remain available.
                 pass
 
             self._bootstrapped = True
 
     @staticmethod
     def _player_payload(
-        video_id,
-        client_name,
-        client_version,
-    ):
+        video_id: str,
+        client_name: str,
+        client_version: str,
+        po_token: str | None = None,
+    ) -> dict[str, Any]:
         client = {
             "clientName": client_name,
             "clientVersion": client_version,
@@ -528,102 +572,98 @@ class YouTubeExtractor:
         if client_name == "ANDROID":
             client["androidSdkVersion"] = 35
 
+        if po_token:
+            client["poToken"] = po_token
+
         return {
             "videoId": video_id,
             "contentCheckOk": True,
             "racyCheckOk": True,
-            "context": {
-                "client": client,
-            },
+            "context": {"client": client},
         }
 
     async def _player_request(
         self,
         video_id: str,
-        options: YouTubeOptions,
-        client_name: str,
-        client_version: str,
-    ):
-        user_agent = (
-            _ANDROID_UA
-            if client_name == "ANDROID"
-            else _WEB_UA
-        )
-
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
         payload = self._player_payload(
             video_id,
-            client_name,
-            client_version,
+            config["name"],
+            config["version"],
+            self.po_token,
         )
 
         response = await self._request(
             "POST",
-            f"{_BASE}/youtubei/v1/player",
-            options=options,
-            params={
-                "key": self._api_key,
-            },
+            _PLAYER_URL,
+            params={"key": self._api_key},
             json=payload,
             headers={
-                "User-Agent": user_agent,
+                "User-Agent": config["user_agent"],
                 "Content-Type": "application/json",
                 "Origin": _BASE,
                 "Referer": f"{_BASE}/",
+                "X-YouTube-Client-Name": config["client_id"],
+                "X-YouTube-Client-Version": config["version"],
             },
         )
 
         try:
-            data = response.json()
-        except ValueError as exc:
-            raise YouTubeRequestError(
-                "Invalid player response."
-            ) from exc
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise YouTubeRequestError(
+                    "Invalid YouTube player JSON."
+                ) from exc
         finally:
             await response.aclose()
 
         if not isinstance(data, dict):
             raise YouTubeRequestError(
-                "Unexpected player response."
+                "Unexpected YouTube player response."
             )
 
-        data["_extractor_client"] = client_name
-        data["_extractor_user_agent"] = user_agent
-
+        data["_extractor_client"] = config["name"]
+        data["_extractor_user_agent"] = config["user_agent"]
         return data
 
     @staticmethod
-    def _player_status(data):
-        return (
-            data.get("playabilityStatus") or {}
-        ).get("status")
+    def _player_status(data: dict[str, Any]) -> str | None:
+        status = data.get("playabilityStatus") or {}
+        if not isinstance(status, dict):
+            return None
+        return status.get("status")
 
     @staticmethod
-    def _player_formats(data):
+    def _player_formats(data: dict[str, Any]) -> list:
         streaming = data.get("streamingData") or {}
-
         if not isinstance(streaming, dict):
             return []
 
-        return (
-            streaming.get("formats") or []
-        ) + (
-            streaming.get("adaptiveFormats") or []
-        )
+        regular = streaming.get("formats") or []
+        adaptive = streaming.get("adaptiveFormats") or []
 
-    async def _player(self, video_id, options):
+        if not isinstance(regular, list):
+            regular = []
+        if not isinstance(adaptive, list):
+            adaptive = []
+
+        return regular + adaptive
+
+    async def _player(
+        self,
+        video_id: str,
+        options: YouTubeOptions | None = None,
+    ) -> dict[str, Any]:
         await self._bootstrap()
 
-        errors = []
+        errors: list[Exception] = []
         restricted_reason = None
 
-        for client_name, version, _ in _PLAYER_CLIENTS:
+        for config in _PLAYER_CLIENTS:
             try:
-                data = await self._player_request(
-                    video_id,
-                    options,
-                    client_name,
-                    version,
-                )
+                data = await self._player_request(video_id, config)
             except YouTubeRestricted as exc:
                 errors.append(exc)
                 continue
@@ -637,46 +677,37 @@ class YouTubeExtractor:
             if status in (None, "OK") and formats:
                 return data
 
-            if status in (
-                "LOGIN_REQUIRED",
-                "AGE_CHECK_REQUIRED",
-                "CONTENT_CHECK_REQUIRED",
-                "AGE_VERIFICATION_REQUIRED",
-            ):
-                restricted_reason = (
-                    (data.get("playabilityStatus") or {}).get(
-                        "reason"
-                    ) or status
-                )
+            playability = data.get("playabilityStatus") or {}
+            reason = (
+                playability.get("reason")
+                if isinstance(playability, dict)
+                else None
+            )
 
-            if status not in (None, "OK"):
+            if status in _RESTRICTED_STATUSES:
+                restricted_reason = reason or status
+                continue
+
+            if status in _UNAVAILABLE_STATUSES:
                 errors.append(
-                    YouTubeUnavailable(
-                        str(
-                            (data.get("playabilityStatus") or {}).get(
-                                "reason"
-                            ) or status
-                        )
-                    )
+                    YouTubeUnavailable(str(reason or status))
                 )
                 continue
 
             errors.append(
                 YouTubeRequestError(
-                    f"{client_name} returned no usable formats."
+                    f"{config['name']} returned no usable formats."
                 )
             )
 
         if restricted_reason:
-            raise YouTubeRestricted(
-                str(restricted_reason)
-            )
+            raise YouTubeRestricted(str(restricted_reason))
 
         if errors:
             raise errors[-1]
 
         raise YouTubeRequestError(
-            "Unable to obtain YouTube player response."
+            "Unable to obtain a usable YouTube player response."
         )
 
     @staticmethod
@@ -688,15 +719,13 @@ class YouTubeExtractor:
 
         value = value.strip()
 
-        if _ID_RE.fullmatch(value):
+        if is_video_id(value):
             return value
 
         try:
             parsed = urlparse(value)
         except ValueError as exc:
-            raise YouTubeExtractorError(
-                "Invalid YouTube URL."
-            ) from exc
+            raise YouTubeExtractorError("Invalid YouTube URL.") from exc
 
         host = (parsed.hostname or "").lower()
 
@@ -706,8 +735,8 @@ class YouTubeExtractor:
             "m.youtube.com",
             "music.youtube.com",
             "youtu.be",
-            "www.youtube-nocookie.com",
             "youtube-nocookie.com",
+            "www.youtube-nocookie.com",
         }
 
         if host not in allowed_hosts:
@@ -720,42 +749,30 @@ class YouTubeExtractor:
         if host == "youtu.be":
             video_id = parsed.path.strip("/").split("/")[0]
 
-        elif host in (
+        elif host in {
             "youtube.com",
             "www.youtube.com",
             "m.youtube.com",
             "music.youtube.com",
-        ):
-            query = parse_qs(parsed.query)
-            video_id = query.get("v", [None])[0]
+        }:
+            video_id = parse_qs(parsed.query).get("v", [None])[0]
 
             if not video_id:
-                parts = [
-                    part for part in parsed.path.split("/")
-                    if part
-                ]
-
-                if len(parts) >= 2 and parts[0] in (
+                parts = [part for part in parsed.path.split("/") if part]
+                if len(parts) >= 2 and parts[0] in {
                     "shorts",
                     "live",
                     "embed",
                     "v",
-                ):
+                }:
                     video_id = parts[1]
 
         else:
-            parts = [
-                part for part in parsed.path.split("/")
-                if part
-            ]
-
+            parts = [part for part in parsed.path.split("/") if part]
             if len(parts) >= 2 and parts[0] == "embed":
                 video_id = parts[1]
 
-        if (
-            not video_id
-            or not _ID_RE.fullmatch(video_id)
-        ):
+        if not is_video_id(video_id):
             raise YouTubeExtractorError(
                 "Invalid YouTube video URL or ID."
             )
@@ -763,31 +780,620 @@ class YouTubeExtractor:
         return video_id
 
     @staticmethod
-    def _text(value: Any):
-        if isinstance(value, str):
-            return value or None
+    def _mapping(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
 
-        if not isinstance(value, dict):
+    @staticmethod
+    def _list(value: Any) -> list:
+        return value if isinstance(value, list) else []
+
+    @staticmethod
+    def _text(value: Any) -> str | None:
+        return text_value(value)
+
+    @staticmethod
+    def _first_text(*values: Any) -> str | None:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _duration(value: Any) -> int | None:
+        result = safe_int(value)
+        return result if result is not None and result >= 0 else None
+
+    @staticmethod
+    def _thumbnails(data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, dict):
+            data = data.get("thumbnails")
+
+        if not isinstance(data, list):
+            return []
+
+        output = []
+        seen = set()
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            url = item.get("url")
+            if not isinstance(url, str):
+                continue
+            if not url.startswith(("https://", "http://")):
+                continue
+            if url in seen:
+                continue
+
+            seen.add(url)
+            output.append({
+                "url": url,
+                "width": safe_int(item.get("width")),
+                "height": safe_int(item.get("height")),
+            })
+
+        return output
+
+    @staticmethod
+    def _mime_info(
+        mime_type: str | None,
+    ) -> tuple[str | None, str | None]:
+        if not isinstance(mime_type, str):
+            return None, None
+
+        mime = mime_type.split(";", 1)[0].strip().lower()
+        match = re.search(r'codecs="([^"]+)"', mime_type)
+        codecs = match.group(1) if match else None
+
+        extension = {
+            "audio/mp4": "m4a",
+            "audio/webm": "webm",
+            "video/mp4": "mp4",
+            "video/webm": "webm",
+            "application/vnd.apple.mpegurl": "m3u8",
+            "application/x-mpegurl": "m3u8",
+        }.get(mime)
+
+        return extension, codecs
+
+    @staticmethod
+    def _codec_family(codecs: str | None) -> list[str]:
+        if not codecs:
+            return []
+
+        output = []
+
+        for codec in codecs.lower().split(","):
+            codec = codec.strip()
+
+            if codec.startswith(("avc", "h264")):
+                family = "h264"
+            elif codec.startswith(("hev", "hvc", "h265")):
+                family = "h265"
+            elif codec.startswith("vp8"):
+                family = "vp8"
+            elif codec.startswith(("vp9", "vp09")):
+                family = "vp9"
+            elif codec.startswith(("av01", "av1")):
+                family = "av1"
+            elif codec.startswith(("mp4a", "aac")):
+                family = "aac"
+            elif codec.startswith("opus"):
+                family = "opus"
+            elif codec.startswith("vorbis"):
+                family = "vorbis"
+            else:
+                family = codec.split(".", 1)[0] or "unknown"
+
+            if family not in output:
+                output.append(family)
+
+        return output
+
+    def _parse_format(
+        self,
+        raw: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not isinstance(raw, dict):
             return None
 
-        simple = value.get("simpleText")
+        itag = safe_int(raw.get("itag"))
+        if itag is None:
+            return None
 
-        if isinstance(simple, str):
-            return simple or None
+        mime_type = raw.get("mimeType")
+        extension, codecs = self._mime_info(mime_type)
+        codec_families = self._codec_family(codecs)
 
-        runs = value.get("runs")
+        cipher = raw.get("signatureCipher") or raw.get("cipher")
+        signature_data = None
 
-        if isinstance(runs, list):
-            result = "".join(
-                item.get("text", "")
-                for item in runs
-                if isinstance(item, dict)
-                and isinstance(item.get("text", ""), str)
-            ).strip()
+        if isinstance(cipher, str):
+            parsed_cipher = parse_qs(cipher)
+            signature_data = {
+                key: values[0]
+                for key, values in parsed_cipher.items()
+                if values
+            }
 
-            return result or None
+        direct_url = raw.get("url")
+        if not isinstance(direct_url, str):
+            direct_url = None
 
-        return None
+        if direct_url and not direct_url.startswith("https://"):
+            direct_url = None
+
+        requires_signature = bool(
+            signature_data and signature_data.get("s")
+        )
+
+        requires_n_transform = bool(
+            direct_url
+            and re.search(r"(?:^|[&?])n=[^&]+", direct_url)
+        )
+
+        if requires_signature:
+            direct_url = None
+
+        has_audio = raw.get("audioQuality") is not None or any(
+            codec in {"aac", "opus", "vorbis"}
+            for codec in codec_families
+        )
+
+        has_video = (
+            raw.get("width") is not None
+            or raw.get("height") is not None
+            or any(
+                codec in {"h264", "h265", "vp8", "vp9", "av1"}
+                for codec in codec_families
+            )
+        )
+
+        if has_audio and has_video:
+            media_type = "video"
+            format_type = "muxed"
+        elif has_video:
+            media_type = "video"
+            format_type = "video"
+        elif has_audio:
+            media_type = "audio"
+            format_type = "audio"
+        else:
+            media_type = "unknown"
+            format_type = "unknown"
+
+        return {
+            "itag": itag,
+            "url": direct_url,
+            "mime_type": mime_type,
+            "extension": extension,
+            "codecs": codecs,
+            "codec_families": codec_families,
+            "type": media_type,
+            "format_type": format_type,
+            "width": safe_int(raw.get("width")),
+            "height": safe_int(raw.get("height")),
+            "fps": safe_int(raw.get("fps")),
+            "quality": self._first_text(
+                raw.get("qualityLabel"),
+                raw.get("quality"),
+                raw.get("audioQuality"),
+            ),
+            "bitrate": safe_int(raw.get("bitrate")),
+            "average_bitrate": safe_int(raw.get("averageBitrate")),
+            "audio_bitrate": safe_int(raw.get("audioBitrate")),
+            "audio_quality": raw.get("audioQuality"),
+            "sample_rate": safe_int(raw.get("audioSampleRate")),
+            "channels": safe_int(raw.get("audioChannels")),
+            "content_length": normalize_content_length(
+                raw.get("contentLength")
+            ),
+            "language": raw.get("language"),
+            "is_drc": bool(raw.get("isDrc")),
+            "is_live": bool(raw.get("isLive")),
+            "is_hls": bool(raw.get("isHls")),
+            "is_dash": bool(raw.get("isDash")),
+            "has_audio": bool(has_audio),
+            "has_video": bool(has_video),
+            "is_direct": bool(direct_url),
+            "requires_signature": requires_signature,
+            "requires_n_transform": requires_n_transform,
+            "signature_data": signature_data,
+            "init_range": raw.get("initRange"),
+            "index_range": raw.get("indexRange"),
+            "last_modified": raw.get("lastModified"),
+            "approx_duration_ms": safe_int(raw.get("approxDurationMs")),
+            "projection_type": raw.get("projectionType"),
+            "audio_track": raw.get("audioTrack"),
+            "source": "player_response",
+        }
+
+    def _extract_formats(
+        self,
+        player: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        streaming = self._mapping(player.get("streamingData"))
+
+        raw_formats = (
+            self._list(streaming.get("formats"))
+            + self._list(streaming.get("adaptiveFormats"))
+        )
+
+        output = []
+        seen = set()
+
+        for raw in raw_formats:
+            parsed = self._parse_format(raw)
+            if not parsed:
+                continue
+
+            key = (
+                parsed["itag"],
+                parsed["mime_type"],
+                parsed["quality"],
+            )
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            output.append(parsed)
+
+        output.sort(
+            key=format_sort_key,
+            reverse=True,
+        )
+        return output
+
+    def _extract_captions(
+        self,
+        player: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        captions = self._mapping(
+            self._mapping(player.get("captions")).get(
+                "playerCaptionsTracklistRenderer"
+            )
+        )
+
+        output = []
+        seen = set()
+
+        for track in self._list(captions.get("captionTracks")):
+            if not isinstance(track, dict):
+                continue
+
+            base_url = track.get("baseUrl")
+            language_code = track.get("languageCode")
+
+            if not isinstance(base_url, str) or not language_code:
+                continue
+
+            key = (language_code, track.get("kind"))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            output.append({
+                "language_code": language_code,
+                "language_name": self._text(track.get("name")),
+                "kind": track.get("kind"),
+                "is_auto_generated": track.get("kind") == "asr",
+                "is_translatable": bool(track.get("isTranslatable")),
+                "base_url": base_url,
+                "vss_id": track.get("vssId"),
+                "source": "player_response",
+            })
+
+        return output
+
+    def _extract_translation_languages(
+        self,
+        player: dict[str, Any],
+    ) -> list[dict[str, str]]:
+        captions = self._mapping(
+            self._mapping(player.get("captions")).get(
+                "playerCaptionsTracklistRenderer"
+            )
+        )
+
+        output = []
+
+        for item in self._list(captions.get("translationLanguages")):
+            if not isinstance(item, dict):
+                continue
+
+            code = item.get("languageCode")
+            if not code:
+                continue
+
+            name = self._text(item.get("languageName"))
+
+            output.append({
+                "language_code": str(code),
+                "language_name": name or str(code),
+            })
+
+        return output
+
+    def _extract_chapters(
+        self,
+        player: dict[str, Any],
+        duration: int | None,
+    ) -> list[dict[str, Any]]:
+        chapters = []
+        seen = set()
+
+        def visit(node: Any) -> None:
+            if isinstance(node, list):
+                for item in node:
+                    visit(item)
+                return
+
+            if not isinstance(node, dict):
+                return
+
+            renderer = (
+                node.get("macroMarkersListItemRenderer")
+                or node.get("chapterRenderer")
+            )
+
+            if isinstance(renderer, dict):
+                title = self._text(
+                    renderer.get("title")
+                    or renderer.get("header")
+                )
+
+                start_ms = safe_int(
+                    renderer.get("timeRangeStartMillis")
+                    or renderer.get("timeStartMs")
+                )
+
+                if start_ms is None:
+                    start_seconds = safe_int(
+                        renderer.get("timeStart")
+                        or renderer.get("startTime")
+                    )
+                    if start_seconds is not None:
+                        start_ms = start_seconds * 1000
+
+                if start_ms is not None and title:
+                    start = max(0, start_ms // 1000)
+
+                    if duration is None or start <= duration:
+                        if start not in seen:
+                            seen.add(start)
+                            chapters.append({
+                                "start_time": start,
+                                "start_time_ms": start_ms,
+                                "title": title,
+                            })
+
+            for value in node.values():
+                if isinstance(value, (dict, list)):
+                    visit(value)
+
+        visit(player.get("chapters"))
+        visit(player.get("frameworkUpdates"))
+
+        chapters.sort(key=lambda item: item["start_time"])
+
+        for index, chapter in enumerate(chapters):
+            chapter["end_time"] = (
+                chapters[index + 1]["start_time"]
+                if index + 1 < len(chapters)
+                else duration
+            )
+
+        return chapters
+
+    def _extract_details(
+        self,
+        player: dict[str, Any],
+        video_id: str,
+    ) -> dict[str, Any]:
+        details = self._mapping(player.get("videoDetails"))
+        micro = self._mapping(
+            self._mapping(player.get("microformat")).get(
+                "playerMicroformatRenderer"
+            )
+        )
+
+        duration = self._duration(details.get("lengthSeconds"))
+        if duration is None:
+            duration = self._duration(micro.get("lengthSeconds"))
+
+        thumbnails = self._thumbnails(
+            details.get("thumbnail") or micro.get("thumbnail")
+        )
+
+        live_details = self._mapping(
+            micro.get("liveBroadcastDetails")
+        )
+
+        return {
+            "id": video_id,
+            "title": self._first_text(
+                details.get("title"),
+                self._text(micro.get("title")),
+            ),
+            "description": details.get("shortDescription"),
+            "channel": self._first_text(
+                details.get("author"),
+                micro.get("ownerChannelName"),
+            ),
+            "channel_id": self._first_text(
+                details.get("channelId"),
+                micro.get("externalChannelId"),
+            ),
+            "duration": duration,
+            "duration_string": str(duration) if duration is not None else None,
+            "view_count": safe_int(details.get("viewCount")),
+            "is_live": bool(
+                details.get("isLiveContent")
+                or live_details
+            ),
+            "is_private": bool(details.get("isPrivate")),
+            "is_unlisted": bool(details.get("isUnlisted")),
+            "is_family_safe": details.get("isFamilySafe"),
+            "category": micro.get("category"),
+            "publish_date": micro.get("publishDate"),
+            "upload_date": micro.get("uploadDate"),
+            "available_countries": self._list(
+                micro.get("availableCountries")
+            ),
+            "thumbnails": thumbnails,
+            "thumbnail": thumbnails[-1]["url"] if thumbnails else None,
+            "keywords": self._list(details.get("keywords")),
+            # Do not infer age restriction from unrelated player fields.
+            "age_restricted": None,
+            "live_start_timestamp": live_details.get("startTimestamp"),
+            "live_end_timestamp": live_details.get("endTimestamp"),
+        }
+
+    async def extract(
+        self,
+        url_or_id: str,
+        *,
+        force: bool = False,
+        options: YouTubeOptions | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+
+        video_id = self._video_id(url_or_id)
+        opts = options or self.options
+        cache_key = f"video:{video_id}"
+
+        async def produce():
+            player = await self._player(video_id, opts)
+            details = self._extract_details(player, video_id)
+
+            formats = (
+                self._extract_formats(player)
+                if opts.formats
+                else []
+            )
+
+            captions = (
+                self._extract_captions(player)
+                if opts.captions
+                else []
+            )
+
+            translations = (
+                self._extract_translation_languages(player)
+                if opts.captions
+                else []
+            )
+
+            chapters = (
+                self._extract_chapters(
+                    player,
+                    details.get("duration"),
+                )
+                if opts.chapters
+                else []
+            )
+
+            status_data = self._mapping(
+                player.get("playabilityStatus")
+            )
+
+            result = {
+                **details,
+                "formats": formats,
+                "captions": captions,
+                "translation_languages": translations,
+                "chapters": chapters,
+                "format_count": len(formats),
+                "caption_count": len(captions),
+                "player": {
+                    "status": status_data.get("status"),
+                    "reason": status_data.get("reason"),
+                    "client": player.get("_extractor_client"),
+                },
+                "extractor": "youtube",
+                "webpage_url": f"{_BASE}/watch?v={video_id}",
+            }
+
+            if not opts.thumbnails:
+                result["thumbnails"] = []
+                result["thumbnail"] = None
+
+            if not opts.description:
+                result["description"] = None
+
+            if not opts.tags:
+                result["keywords"] = []
+
+            if opts.raw_response:
+                result["raw_player_response"] = player
+
+            if not opts.metadata:
+                result = {
+                    "id": video_id,
+                    "formats": formats,
+                    "format_count": len(formats),
+                    "extractor": "youtube",
+                    "webpage_url": f"{_BASE}/watch?v={video_id}",
+                }
+
+            if opts.formats and not formats:
+                raise YouTubeUnavailable(
+                    "YouTube returned no playable formats."
+                )
+
+            return result
+
+        if force:
+            result = await produce()
+            await self.metadata_cache.put(cache_key, result)
+            return result
+
+        return await self.metadata_cache.get_or_create(
+            cache_key,
+            produce,
+        )
+
+    async def get_info(
+        self,
+        url_or_id: str,
+        *,
+        force: bool = False,
+        options: YouTubeOptions | None = None,
+    ) -> dict[str, Any]:
+        return await self.extract(
+            url_or_id,
+            force=force,
+            options=options,
+        )
+
+    async def get_formats(
+        self,
+        url_or_id: str,
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        info = await self.extract(url_or_id, force=force)
+        return info.get("formats", [])
+
+    async def get_captions(
+        self,
+        url_or_id: str,
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        info = await self.extract(url_or_id, force=force)
+        return info.get("captions", [])
+
+    async def get_chapters(
+        self,
+        url_or_id: str,
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        info = await self.extract(url_or_id, force=force)
+        return info.get("chapters", [])
 
     @staticmethod
     def _walk(data: Any):
@@ -799,962 +1405,236 @@ class YouTubeExtractor:
             if isinstance(item, dict):
                 yield item
                 stack.extend(reversed(tuple(item.values())))
-
             elif isinstance(item, list):
                 stack.extend(reversed(item))
 
     @staticmethod
-    def _duration(value):
-        try:
-            return int(value)
-        except (
-            TypeError,
-            ValueError,
-            OverflowError,
-        ):
-            return None
-
-    @staticmethod
-    def _thumbnails(data):
-        if not isinstance(data, list):
-            return []
-
-        output = []
-
-        for item in data:
-            if not isinstance(item, dict):
+    def _continuation(data: Any) -> str | None:
+        for node in YouTubeExtractor._walk(data):
+            renderer = node.get("continuationItemRenderer")
+            if not isinstance(renderer, dict):
                 continue
 
-            url = item.get("url")
+            endpoint = renderer.get("continuationEndpoint") or {}
+            command = endpoint.get("continuationCommand") or {}
+            token = command.get("token")
 
-            if not isinstance(url, str):
-                continue
+            if isinstance(token, str) and token:
+                return token
 
-            output.append({
-                "url": url,
-                "width": item.get("width"),
-                "height": item.get("height"),
-            })
-
-        return output
+        return None
 
     @staticmethod
-    def _codec_details(mime):
-        match = re.search(
-            r'codecs="([^"]+)"',
-            mime or "",
-            re.IGNORECASE,
-        )
+    def _playlist_metadata(data: dict[str, Any]) -> dict[str, Any]:
+        metadata = data.get("metadata") or {}
+        renderer = metadata.get("playlistMetadataRenderer") or {}
 
-        codecs = [
-            codec.strip().lower()
-            for codec in (
-                match.group(1) if match else ""
-            ).split(",")
-            if codec.strip()
-        ]
+        if not isinstance(renderer, dict):
+            renderer = {}
 
-        audio_prefixes = (
-            "mp4a",
-            "opus",
-            "vorbis",
-            "aac",
-            "ac-3",
-            "ec-3",
-            "alac",
-            "flac",
-        )
-
-        video_prefixes = (
-            "avc",
-            "av01",
-            "vp8",
-            "vp9",
-            "vp09",
-            "hev",
-            "hvc",
-        )
-
-        audio_codec = next(
-            (
-                codec for codec in codecs
-                if codec.startswith(audio_prefixes)
-            ),
-            None,
-        )
-
-        video_codec = next(
-            (
-                codec for codec in codecs
-                if codec.startswith(video_prefixes)
-            ),
-            None,
-        )
-
-        return (
-            codecs,
-            audio_codec,
-            video_codec,
-        )
-
-    @staticmethod
-    def _extension(mime):
-        mime = (
-            mime or ""
-        ).lower().split(";")[0].strip()
-
-        mapping = {
-            "audio/webm": "webm",
-            "video/webm": "webm",
-            "audio/mp4": "m4a",
-            "video/mp4": "mp4",
-            "audio/mpeg": "mp3",
-            "audio/ogg": "ogg",
-            "video/3gpp": "3gp",
+        return {
+            "title": renderer.get("title"),
+            "description": renderer.get("description"),
+            "privacy": renderer.get("privacy"),
         }
 
-        return mapping.get(mime, "bin")
-
-    @staticmethod
-    def _format_flags(item):
-        mime = (item.get("mimeType") or "").lower()
-
-        (
-            codecs,
-            audio_codec,
-            video_codec,
-        ) = YouTubeExtractor._codec_details(mime)
-
-        has_audio = (
-            mime.startswith("audio/")
-            or audio_codec is not None
-            or item.get("audioQuality") is not None
-            or item.get("audioChannels") is not None
-        )
-
-        has_video = (
-            mime.startswith("video/")
-            or video_codec is not None
-            or item.get("width") is not None
-            or item.get("height") is not None
-        )
-
-        return (
-            has_audio,
-            has_video,
-            codecs,
-            audio_codec,
-            video_codec,
-        )
-
-    @staticmethod
-    def _formats(player):
-        streaming = player.get("streamingData") or {}
-
-        if not isinstance(streaming, dict):
-            return []
-
-        regular = streaming.get("formats") or []
-        adaptive = streaming.get("adaptiveFormats") or []
-
-        if not isinstance(regular, list):
-            regular = []
-
-        if not isinstance(adaptive, list):
-            adaptive = []
-
+    def _playlist_items(
+        self,
+        data: dict[str, Any],
+        *,
+        start_index: int = 0,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
         output = []
         seen = set()
 
-        for item in regular + adaptive:
-            if not isinstance(item, dict):
+        for node in self._walk(data):
+            renderer = node.get("playlistVideoRenderer")
+            if not isinstance(renderer, dict):
                 continue
 
-            itag = item.get("itag")
-            mime = item.get("mimeType") or ""
-
-            cipher = (
-                item.get("signatureCipher")
-                or item.get("cipher")
-            )
-
-            direct_url = item.get("url")
-            cipher_data = {}
-
-            if isinstance(cipher, str):
-                cipher_data = {
-                    key: values[0]
-                    for key, values in parse_qs(
-                        cipher,
-                        keep_blank_values=True,
-                    ).items()
-                    if values
-                }
-
-                cipher_url = cipher_data.get("url")
-
-                if cipher_url and not direct_url:
-                    direct_url = cipher_url
-
-                plain_signature = (
-                    cipher_data.get("sig")
-                    or cipher_data.get("signature")
-                )
-
-                if direct_url and plain_signature:
-                    parsed = urlparse(direct_url)
-
-                    query = parse_qs(
-                        parsed.query,
-                        keep_blank_values=True,
-                    )
-
-                    signature_name = (
-                        cipher_data.get("sp")
-                        or "signature"
-                    )
-
-                    query[signature_name] = [
-                        plain_signature
-                    ]
-
-                    direct_url = urlunparse(
-                        parsed._replace(
-                            query=urlencode(
-                                query,
-                                doseq=True,
-                            )
-                        )
-                    )
-
-                if cipher_data.get("s"):
-                    direct_url = None
-
-            parsed_url = (
-                urlparse(direct_url)
-                if isinstance(direct_url, str)
-                else None
-            )
-
-            query = (
-                parse_qs(parsed_url.query)
-                if parsed_url
-                else {}
-            )
-
-            (
-                has_audio,
-                has_video,
-                codecs,
-                audio_codec,
-                video_codec,
-            ) = YouTubeExtractor._format_flags(item)
-
-            requires_n = bool(query.get("n"))
-            requires_signature = bool(
-                cipher_data.get("s")
-            )
-
-            unique_key = (
-                itag,
-                mime,
-                item.get("qualityLabel"),
-                item.get("bitrate"),
-            )
-
-            if unique_key in seen:
+            video_id = renderer.get("videoId")
+            if not is_video_id(video_id) or video_id in seen:
                 continue
 
-            seen.add(unique_key)
+            seen.add(video_id)
 
-            bitrate = item.get("bitrate")
-            average_bitrate = item.get("averageBitrate")
+            title = self._text(renderer.get("title"))
+            thumbnails = self._thumbnails(renderer.get("thumbnail"))
 
+            length_data = self._mapping(renderer.get("lengthText"))
+            duration_text = length_data.get("simpleText")
+
+            duration = None
+            if isinstance(duration_text, str):
+                try:
+                    duration = 0
+                    for part in duration_text.split(":"):
+                        duration = duration * 60 + int(part)
+                except ValueError:
+                    duration = None
+
+            index_data = self._mapping(renderer.get("index"))
+            index_value = safe_int(index_data.get("simpleText"))
+
+            output.append({
+                "id": video_id,
+                "title": title,
+                "url": f"{_BASE}/watch?v={video_id}",
+                "thumbnail": (
+                    thumbnails[-1]["url"] if thumbnails else None
+                ),
+                "duration": duration,
+                "duration_string": duration_text,
+                "index": (
+                    index_value
+                    if index_value is not None
+                    else start_index + len(output) + 1
+                ),
+                "is_playable": renderer.get("isPlayable", True) is not False,
+                "short_byline": (
+                    self._text(renderer.get("shortBylineText"))
+                    or self._text(renderer.get("longBylineText"))
+                ),
+            })
+
+            if len(output) >= limit:
+                break
+
+        return output
+
+    @staticmethod
+    def _innertube_context() -> dict[str, Any]:
+        return {
+            "client": {
+                "clientName": "ANDROID",
+                "clientVersion": _ANDROID_VERSION,
+                "androidSdkVersion": 35,
+                "hl": "en",
+                "gl": "US",
+            }
+        }
+
+    async def _browse_request(
+        self,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            _BROWSE_URL,
+            params={"key": self._api_key},
+            json=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Origin": _BASE,
+                "Referer": f"{_BASE}/",
+                "User-Agent": _ANDROID_UA,
+            },
+        )
+
+        try:
             try:
-                abr = (
-                    round(bitrate / 1000, 2)
-                    if has_audio and bitrate
-                    else None
-                )
-            except (TypeError, ValueError):
-                abr = None
+                data = response.json()
+            except ValueError as exc:
+                raise YouTubeRequestError(
+                    "YouTube returned invalid browse JSON."
+                ) from exc
+        finally:
+            await response.aclose()
 
-            output.append({
-                "format_id": (
-                    str(itag)
-                    if itag is not None
-                    else None
-                ),
-                "itag": itag,
-                "ext": YouTubeExtractor._extension(mime),
-                "mime_type": mime or None,
-                "quality": item.get("quality"),
-                "quality_label": item.get("qualityLabel"),
-                "width": item.get("width"),
-                "height": item.get("height"),
-                "fps": item.get("fps"),
-                "bitrate": bitrate,
-                "abr": abr,
-                "average_bitrate": average_bitrate,
-                "audio_quality": item.get("audioQuality"),
-                "audio_sample_rate": item.get("audioSampleRate"),
-                "audio_channels": item.get("audioChannels"),
-                "content_length": item.get("contentLength"),
-                "approximate_content_length": item.get(
-                    "approximateContentLength"
-                ),
-                "codecs": codecs,
-                "audio_codec": audio_codec,
-                "video_codec": video_codec,
-                "has_audio": has_audio,
-                "has_video": has_video,
-                "url": direct_url,
-                "is_direct": bool(
-                    direct_url
-                    and not requires_signature
-                    and not requires_n
-                ),
-                "requires_signature": requires_signature,
-                "requires_n_transform": requires_n,
-                "signature_cipher": (
-                    cipher if requires_signature else None
-                ),
-                "client_name": player.get(
-                    "_extractor_client"
-                ),
-                "user_agent": player.get(
-                    "_extractor_user_agent"
-                ),
-            })
-
-        output.sort(
-            key=lambda item: (
-                bool(
-                    item["has_audio"]
-                    and item["has_video"]
-                ),
-                bool(item["is_direct"]),
-                item.get("height") or 0,
-                item.get("bitrate") or 0,
-            ),
-            reverse=True,
-        )
-
-        return output
-
-    @staticmethod
-    def _captions(player, automatic):
-        captions_data = player.get("captions") or {}
-
-        if not isinstance(captions_data, dict):
-            return []
-
-        renderer = captions_data.get(
-            "playerCaptionsTracklistRenderer"
-        ) or {}
-
-        tracks = renderer.get("captionTracks") or []
-
-        if not isinstance(tracks, list):
-            return []
-
-        output = []
-
-        for item in tracks:
-            if not isinstance(item, dict):
-                continue
-
-            is_auto = item.get("kind") == "asr"
-
-            if is_auto and not automatic:
-                continue
-
-            output.append({
-                "language": item.get("languageCode"),
-                "name": YouTubeExtractor._text(
-                    item.get("name")
-                ),
-                "url": item.get("baseUrl"),
-                "automatic": is_auto,
-                "vss_id": item.get("vssId"),
-            })
-
-        return output
-
-    @staticmethod
-    def _parse_player(video_id, player, options):
-        details = player.get("videoDetails") or {}
-        status = player.get("playabilityStatus") or {}
-
-        microformat = player.get("microformat") or {}
-
-        micro = (
-            microformat.get("playerMicroformatRenderer")
-            or {}
-        )
-
-        if not isinstance(details, dict):
-            details = {}
-
-        if not isinstance(status, dict):
-            status = {}
-
-        status_code = status.get("status")
-
-        if status_code not in (None, "OK"):
-            reason = (
-                status.get("reason")
-                or status_code
-                or "Video unavailable."
+        if not isinstance(data, dict):
+            raise YouTubeRequestError(
+                "Unexpected playlist response."
             )
 
-            if status_code in (
-                "LOGIN_REQUIRED",
-                "AGE_CHECK_REQUIRED",
-                "CONTENT_CHECK_REQUIRED",
-                "AGE_VERIFICATION_REQUIRED",
-            ):
-                raise YouTubeRestricted(str(reason))
+        return data
 
-            raise YouTubeUnavailable(str(reason))
+    async def get_playlist_next(
+        self,
+        playlist_id: str,
+        continuation: str,
+        *,
+        limit: int = 100,
+        options: YouTubeOptions | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(playlist_id, str) or not playlist_id.strip():
+            raise YouTubeExtractorError("Invalid playlist ID.")
 
-        thumbnail_data = details.get("thumbnail") or {}
+        if not isinstance(continuation, str) or not continuation:
+            raise YouTubeExtractorError("Invalid continuation token.")
+
+        limit = max(1, min(int(limit), 500))
+
+        data = await self._browse_request({
+            "context": self._innertube_context(),
+            "continuation": continuation,
+        })
+
+        items = self._playlist_items(data, limit=limit)
+        next_token = self._continuation(data)
+
+        return {
+            "id": playlist_id,
+            "items": items,
+            "continuation": next_token,
+            "has_more": bool(next_token),
+        }
+
+    async def get_playlist(
+        self,
+        playlist_id: str,
+        *,
+        limit: int = 100,
+        flat: bool = True,
+        options: YouTubeOptions | None = None,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_open()
+
+        if not isinstance(playlist_id, str):
+            raise YouTubeExtractorError("Invalid playlist ID.")
+
+        playlist_id = playlist_id.strip()
+
+        if playlist_id.startswith(("http://", "https://")):
+            parsed = urlparse(playlist_id)
+            playlist_id = parse_qs(parsed.query).get("list", [None])[0]
+
+        if not playlist_id or not _PLAYLIST_RE.fullmatch(playlist_id):
+            raise YouTubeExtractorError("Invalid YouTube playlist ID.")
+
+        limit = max(1, min(int(limit), 500))
+        cache_key = f"playlist:{playlist_id}:{limit}:{bool(flat)}"
+
+        if not refresh:
+            cached = await self.playlist_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        data = await self._browse_request({
+            "context": self._innertube_context(),
+            "browseId": f"VL{playlist_id}",
+        })
+
+        metadata = self._playlist_metadata(data)
+        items = self._playlist_items(data, limit=limit)
+        continuation = self._continuation(data)
 
         result = {
-            "id": video_id,
-            "title": details.get("title"),
-            "url": f"{_BASE}/watch?v={video_id}",
-            "author": details.get("author"),
-            "channel_id": details.get("channelId"),
-            "duration": YouTubeExtractor._duration(
-                details.get("lengthSeconds")
-            ),
-            "view_count": YouTubeExtractor._duration(
-                details.get("viewCount")
-            ),
-            "is_live": bool(
-                details.get("isLiveContent")
-            ),
-            "is_private": bool(
-                details.get("isPrivate")
-            ),
-            "is_unlisted": bool(
-                details.get("isUnlisted")
-            ),
-            "is_family_safe": details.get("isFamilySafe"),
-            "category": micro.get("category"),
-            "upload_date": micro.get("uploadDate"),
-            "publish_date": micro.get("publishDate"),
-            "owner_channel_url": micro.get(
-                "ownerProfileUrl"
-            ),
-            "description": (
-                details.get("shortDescription")
-                if options.description
-                else None
-            ),
-            "tags": (
-                details.get("keywords") or []
-                if options.tags
-                else []
-            ),
-            "thumbnails": (
-                YouTubeExtractor._thumbnails(
-                    thumbnail_data.get("thumbnails")
-                )
-                if options.thumbnails
-                else []
-            ),
-            "formats": (
-                YouTubeExtractor._formats(player)
-                if options.formats
-                else []
-            ),
-            "captions": [],
-            "automatic_captions": [],
-            "chapters": [],
-            "related_videos": [],
-            "playlist": None,
-            "playability_status": status_code,
-            "playability_reason": status.get("reason"),
-            "hls_manifest_url": None,
-            "dash_manifest_url": None,
+            "id": playlist_id,
+            "title": metadata.get("title"),
+            "description": metadata.get("description"),
+            "privacy": metadata.get("privacy"),
+            "url": f"{_BASE}/playlist?list={playlist_id}",
+            "video_count": None,
+            "items": items,
+            "continuation": continuation,
+            "has_more": bool(continuation),
+            "flat": bool(flat),
         }
 
-        if options.captions:
-            captions = YouTubeExtractor._captions(
-                player,
-                options.automatic_captions,
-            )
-
-            result["captions"] = [
-                item for item in captions
-                if not item["automatic"]
-            ]
-
-            if options.automatic_captions:
-                result["automatic_captions"] = [
-                    item for item in captions
-                    if item["automatic"]
-                ]
-
-        if options.chapters:
-            chapters = micro.get("chapters") or []
-
-            result["chapters"] = (
-                chapters
-                if isinstance(chapters, list)
-                else []
-            )
-
-        streaming = player.get("streamingData") or {}
-
-        if not isinstance(streaming, dict):
-            streaming = {}
-
-        if options.hls:
-            result["hls_manifest_url"] = streaming.get(
-                "hlsManifestUrl"
-            )
-
-        if options.dash:
-            result["dash_manifest_url"] = streaming.get(
-                "dashManifestUrl"
-            )
-
-        if options.raw_response:
-            result["raw_response"] = player
-
+        await self.playlist_cache.put(cache_key, result)
         return result
-
-    @staticmethod
-    def _copy_result(value):
-        return json.loads(json.dumps(value))
-
-    @staticmethod
-    def _full_options(options):
-        return YouTubeOptions(
-            metadata=True,
-            formats=True,
-            thumbnails=True,
-            description=True,
-            tags=True,
-            chapters=True,
-            captions=True,
-            automatic_captions=True,
-            watch_playlist=options.watch_playlist,
-            related_videos=options.related_videos,
-            raw_response=options.raw_response,
-            comments=options.comments,
-            hls=options.hls,
-            dash=options.dash,
-            flat_playlist=options.flat_playlist,
-            playlist_limit=options.playlist_limit,
-            retries=options.retries,
-            timeout=options.timeout,
-        )
-
-    async def _fetch_video(self, video_id, options):
-        player = await self._player(video_id, options)
-
-        full_options = self._full_options(options)
-
-        result = self._parse_player(
-            video_id,
-            player,
-            full_options,
-        )
-
-        formats = result.get("formats", [])
-
-        await self.stream_cache.put(
-            f"streams:{video_id}",
-            formats,
-        )
-
-        # Do not keep expiring media URLs in metadata cache.
-        result["formats"] = [
-            {
-                **item,
-                "url": None,
-                "is_direct": False,
-            }
-            for item in formats
-        ]
-
-        return result
-
-    async def extract(
-        self,
-        value: str,
-        *,
-        options: YouTubeOptions | None = None,
-        user_id: str | int | None = None,
-        refresh: bool = False,
-    ):
-        options = options or YouTubeOptions()
-
-        video_id = self._video_id(value)
-        cache_key = f"video:{video_id}"
-
-        async def fetch():
-            return await self._fetch_video(
-                video_id,
-                options,
-            )
-
-        if refresh:
-            result = await fetch()
-
-            await self.metadata_cache.put(
-                cache_key,
-                result,
-            )
-        else:
-            result = await self.metadata_cache.get_or_create(
-                cache_key,
-                fetch,
-            )
-
-        result = self._copy_result(result)
-
-        if not options.metadata:
-            for key in (
-                "title",
-                "author",
-                "channel_id",
-                "duration",
-                "view_count",
-            ):
-                result[key] = None
-
-        if not options.formats:
-            result["formats"] = []
-        else:
-            streams = await self.stream_cache.get(
-                f"streams:{video_id}"
-            )
-
-            if streams is None:
-                async def fetch_streams():
-                    player = await self._player(
-                        video_id,
-                        options,
-                    )
-                    return self._formats(player)
-
-                streams = await self.stream_cache.get_or_create(
-                    f"streams:{video_id}",
-                    fetch_streams,
-                )
-
-            result["formats"] = self._copy_result(streams)
-
-        if not options.thumbnails:
-            result["thumbnails"] = []
-
-        if not options.description:
-            result["description"] = None
-
-        if not options.tags:
-            result["tags"] = []
-
-        if not options.captions:
-            result["captions"] = []
-            result["automatic_captions"] = []
-
-        elif not options.automatic_captions:
-            result["automatic_captions"] = []
-
-        if not options.chapters:
-            result["chapters"] = []
-
-        if not options.hls:
-            result["hls_manifest_url"] = None
-
-        if not options.dash:
-            result["dash_manifest_url"] = None
-
-        if options.raw_response:
-            raw = await self._player(
-                video_id,
-                options,
-            )
-
-            result["raw_response"] = raw
-        else:
-            result.pop("raw_response", None)
-
-        return result
-
-    async def _fresh_format(
-        self,
-        video_id,
-        itag,
-        options,
-        client_name=None,
-    ):
-        if client_name is None:
-            player = await self._player(
-                video_id,
-                options,
-            )
-        else:
-            selected_client = next(
-                (
-                    item for item in _PLAYER_CLIENTS
-                    if item[0] == client_name
-                ),
-                None,
-            )
-
-            if selected_client is None:
-                raise YouTubeExtractorError(
-                    "Unsupported player client."
-                )
-
-            player = await self._player_request(
-                video_id,
-                options,
-                selected_client[0],
-                selected_client[1],
-            )
-
-        selected = next(
-            (
-                item for item in self._formats(player)
-                if item.get("itag") == itag
-            ),
-            None,
-        )
-
-        if not selected:
-            raise YouTubeUnavailable(
-                f"Format {itag} is unavailable."
-            )
-
-        if (
-            not selected.get("url")
-            or not selected.get("is_direct")
-        ):
-            raise YouTubeExtractorError(
-                "This format requires signature or n-parameter "
-                "deciphering and has no usable direct URL."
-            )
-
-        return selected
-
-    @staticmethod
-    def _safe_target(output: str | Path):
-        try:
-            target = Path(output).expanduser()
-        except (TypeError, ValueError) as exc:
-            raise YouTubeExtractorError(
-                "Invalid output path."
-            ) from exc
-
-        if not target.name or target.name in (".", ".."):
-            raise YouTubeExtractorError(
-                "Invalid output filename."
-            )
-
-        if "\x00" in str(target):
-            raise YouTubeExtractorError(
-                "Invalid output path."
-            )
-
-        return target
-
-    @staticmethod
-    def _read_resume_metadata(path: Path):
-        try:
-            data = json.loads(
-                path.read_text(encoding="utf-8")
-            )
-
-            if not isinstance(data, dict):
-                return None
-
-            return data
-
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-        ):
-            return None
-
-    @staticmethod
-    def _write_resume_metadata(
-        path: Path,
-        video_id: str,
-        itag: int,
-        total: int | None,
-    ):
-        data = {
-            "video_id": video_id,
-            "itag": itag,
-            "total": total,
-        }
-
-        temporary = path.with_name(
-            path.name + ".tmp"
-        )
-
-        temporary.write_text(
-            json.dumps(data),
-            encoding="utf-8",
-        )
-
-        temporary.replace(path)
-
-    async def _download_range(
-        self,
-        url: str,
-        start: int,
-        end: int,
-        *,
-        video_id: str,
-        user_agent: str,
-        timeout: float,
-    ):
-        headers = {
-            "Range": f"bytes={start}-{end}",
-            "Accept-Encoding": "identity",
-            "User-Agent": user_agent,
-            "Referer": f"{_BASE}/watch?v={video_id}",
-            "Origin": _BASE,
-        }
-
-        async with self.client.stream(
-            "GET",
-            url,
-            headers=headers,
-            follow_redirects=True,
-            timeout=httpx.Timeout(
-                timeout,
-                read=max(60.0, timeout),
-            ),
-        ) as response:
-            if response.status_code == 416:
-                content_range = response.headers.get(
-                    "Content-Range",
-                    "",
-                )
-
-                match = re.fullmatch(
-                    r"bytes\s+\*/(\d+)",
-                    content_range.strip(),
-                    re.IGNORECASE,
-                )
-
-                total = (
-                    int(match.group(1))
-                    if match
-                    else None
-                )
-
-                return {
-                    "status": 416,
-                    "data": b"",
-                    "total": total,
-                    "start": start,
-                    "end": end,
-                }
-
-            if response.status_code in (
-                403,
-                429,
-                500,
-                502,
-                503,
-                504,
-            ):
-                status = response.status_code
-                await response.aread()
-
-                return {
-                    "status": status,
-                    "data": b"",
-                    "total": None,
-                    "start": start,
-                    "end": end,
-                }
-
-            if response.status_code == 200:
-                data = await response.aread()
-
-                return {
-                    "status": 200,
-                    "data": data,
-                    "total": len(data),
-                    "start": start,
-                    "end": end,
-                }
-
-            if response.status_code != 206:
-                raise YouTubeRequestError(
-                    f"Media server returned HTTP "
-                    f"{response.status_code}."
-                )
-
-            content_range = response.headers.get(
-                "Content-Range",
-                "",
-            )
-
-            match = _CONTENT_RANGE_RE.fullmatch(
-                content_range.strip()
-            )
-
-            if not match:
-                raise YouTubeRequestError(
-                    "Invalid Content-Range from media server."
-                )
-
-            range_start = int(match.group(1))
-            range_end = int(match.group(2))
-            total_text = match.group(3)
-
-            if range_start != start:
-                raise YouTubeRequestError(
-                    "Media server returned an unexpected "
-                    "range offset."
-                )
-
-            if range_end < range_start or range_end > end:
-                raise YouTubeRequestError(
-                    "Media server returned an invalid range."
-                )
-
-            expected_size = range_end - range_start + 1
-
-            data = await response.aread()
-
-            if len(data) != expected_size:
-                raise YouTubeRequestError(
-                    "Incomplete media chunk received."
-                )
-
-            total = (
-                int(total_text)
-                if total_text != "*"
-                else None
-            )
-
-            if total is not None and range_end >= total:
-                if range_end != total - 1:
-                    raise YouTubeRequestError(
-                        "Media range exceeds total file size."
-                    )
-
-            return {
-                "status": 206,
-                "data": data,
-                "total": total,
-                "start": range_start,
-                "end": range_end,
-            }
 
     async def download_format(
         self,
@@ -1766,835 +1646,223 @@ class YouTubeExtractor:
         chunk_size: int = 1024 * 1024,
         resume: bool = True,
         max_url_refreshes: int = 3,
-    ):
-        """
-        Download a direct media format.
+    ) -> dict[str, Any]:
+        self._ensure_open()
 
-        Features:
-            - HTTP Range requests.
-            - Resume using .part and .part.json.
-            - 416 completed-file validation.
-            - Client-specific User-Agent.
-            - Alternate player client fallback.
-            - Fresh URL after expired URL responses.
-            - Final size verification.
-
-        Note:
-            YouTube may reject range requests or require a PO Token.
-            Client fallback cannot guarantee access.
-        """
         video_id = self._video_id(video_id)
-        options = options or YouTubeOptions()
+        itag = safe_int(itag)
 
-        try:
-            itag = int(itag)
+        if itag is None:
+            raise YouTubeExtractorError("Invalid format itag.")
 
-            chunk_size = max(
-                64 * 1024,
-                min(int(chunk_size), 8 * 1024 * 1024),
-            )
-
-            max_url_refreshes = max(
-                1,
-                min(int(max_url_refreshes), 8),
-            )
-
-        except (TypeError, ValueError) as exc:
-            raise YouTubeExtractorError(
-                "Invalid download parameters."
-            ) from exc
-
-        target = self._safe_target(output)
-
-        await asyncio.to_thread(
-            target.parent.mkdir,
-            parents=True,
-            exist_ok=True,
+        chunk_size = max(
+            64 * 1024,
+            min(int(chunk_size), 8 * 1024 * 1024),
         )
+        max_url_refreshes = max(0, min(int(max_url_refreshes), 5))
 
-        temporary = target.with_name(
-            target.name + ".part"
-        )
+        output_path = Path(output).expanduser()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        metadata_file = target.with_name(
-            target.name + ".part.json"
-        )
+        part_path = output_path.with_name(output_path.name + ".part")
 
-        identity = {
-            "video_id": video_id,
-            "itag": itag,
-        }
+        async with self._download_semaphore:
+            info = await self.extract(video_id, options=options)
 
-        expected_total = None
-        downloaded = 0
-
-        if resume and temporary.is_file():
-            saved = await asyncio.to_thread(
-                self._read_resume_metadata,
-                metadata_file,
-            )
-
-            if (
-                saved
-                and saved.get("video_id") == video_id
-                and saved.get("itag") == itag
-            ):
-                downloaded = await asyncio.to_thread(
-                    lambda: temporary.stat().st_size
-                )
-
-                expected_total = saved.get("total")
-
-                if not isinstance(expected_total, int):
-                    expected_total = None
-
-            else:
-                downloaded = 0
-
-        if downloaded == 0:
-            await asyncio.to_thread(
-                temporary.unlink,
-                missing_ok=True,
-            )
-
-            await asyncio.to_thread(
-                self._write_resume_metadata,
-                metadata_file,
-                video_id,
-                itag,
+            selected = next(
+                (
+                    item for item in info.get("formats", [])
+                    if item.get("itag") == itag
+                ),
                 None,
             )
 
-        if (
-            expected_total is not None
-            and downloaded > expected_total
-        ):
-            await asyncio.to_thread(
-                temporary.unlink,
-                missing_ok=True,
-            )
+            if not selected:
+                raise YouTubeUnavailable(
+                    f"Format itag {itag} is not available."
+                )
 
-            downloaded = 0
-            expected_total = None
+            if not selected.get("url"):
+                raise YouTubeUnavailable(
+                    "This format has no direct URL. Signature or n "
+                    "deciphering is not implemented."
+                )
 
-        current_format = None
-        refreshes = 0
-        client_index = 0
+            expected_size = selected.get("content_length")
 
-        try:
-            current_format = await self._fresh_format(
-                video_id,
-                itag,
-                options,
-            )
+            if resume and part_path.exists():
+                downloaded = part_path.stat().st_size
+            else:
+                downloaded = 0
+                part_path.unlink(missing_ok=True)
 
-            client_names = [
-                item[0]
-                for item in _PLAYER_CLIENTS
-            ]
+            if expected_size is not None and downloaded > expected_size:
+                part_path.unlink(missing_ok=True)
+                downloaded = 0
+
+            refreshes = 0
 
             while True:
-                if (
-                    expected_total is not None
-                    and downloaded == expected_total
-                ):
-                    break
+                current_url = selected.get("url")
+                if not current_url:
+                    raise YouTubeUnavailable("No direct media URL available.")
 
-                end = (
-                    downloaded
-                    + chunk_size
-                    - 1
-                )
+                headers = {
+                    "User-Agent": _ANDROID_UA,
+                    "Accept": "*/*",
+                    "Accept-Encoding": "identity",
+                }
 
-                user_agent = (
-                    current_format.get("user_agent")
-                    or _WEB_UA
-                )
+                if downloaded:
+                    headers["Range"] = f"bytes={downloaded}-"
 
-                async with self._download_semaphore:
-                    result = await self._download_range(
-                        current_format["url"],
-                        downloaded,
-                        end,
-                        video_id=video_id,
-                        user_agent=user_agent,
-                        timeout=options.timeout,
-                    )
+                refresh_needed = False
 
-                status = result["status"]
+                try:
+                    async with self.client.stream(
+                        "GET",
+                        current_url,
+                        headers=headers,
+                        follow_redirects=True,
+                    ) as response:
+                        status = response.status_code
 
-                if status == 416:
-                    total = result.get("total")
+                        if status in (401, 403):
+                            refresh_needed = True
 
-                    if (
-                        total is not None
-                        and downloaded == total
-                        and temporary.is_file()
-                    ):
-                        actual = await asyncio.to_thread(
-                            lambda: temporary.stat().st_size
-                        )
+                        elif status in _TRANSIENT_HTTP:
+                            raise YouTubeRequestError(
+                                f"Media server returned HTTP {status}."
+                            )
 
-                        if actual == total:
-                            expected_total = total
-                            break
+                        elif status not in (200, 206):
+                            raise YouTubeRequestError(
+                                f"Media download failed with HTTP {status}."
+                            )
 
-                    if total is not None and downloaded > total:
-                        await asyncio.to_thread(
-                            temporary.unlink,
-                            missing_ok=True,
-                        )
+                        if not refresh_needed:
+                            if status == 200 and downloaded:
+                                # Server ignored Range: restart from zero.
+                                downloaded = 0
 
-                        downloaded = 0
-                        expected_total = total
+                            if status == 206:
+                                parsed_range = parse_content_range(
+                                    response.headers.get("Content-Range", "")
+                                )
 
-                        await asyncio.to_thread(
-                            self._write_resume_metadata,
-                            metadata_file,
-                            video_id,
-                            itag,
-                            expected_total,
-                        )
+                                if not parsed_range:
+                                    raise YouTubeRequestError(
+                                        "Invalid Content-Range response."
+                                    )
 
-                        continue
+                                range_start, range_end, range_total = (
+                                    parsed_range
+                                )
 
+                                if range_start != downloaded:
+                                    raise YouTubeRequestError(
+                                        "Unexpected range offset returned "
+                                        "by the media server."
+                                    )
+
+                                if range_total is not None:
+                                    expected_size = range_total
+
+                                expected_chunk = range_end - range_start + 1
+                            else:
+                                content_length = safe_int(
+                                    response.headers.get("Content-Length")
+                                )
+                                if content_length is not None:
+                                    expected_size = content_length
+                                expected_chunk = expected_size
+
+                            mode = "ab" if downloaded else "wb"
+                            received_this_response = 0
+
+                            with part_path.open(mode) as file:
+                                async for chunk in response.aiter_bytes(
+                                    chunk_size
+                                ):
+                                    if not chunk:
+                                        continue
+
+                                    file.write(chunk)
+                                    downloaded += len(chunk)
+                                    received_this_response += len(chunk)
+
+                            if (
+                                expected_chunk is not None
+                                and received_this_response != expected_chunk
+                            ):
+                                raise YouTubeRequestError(
+                                    "Media response length did not match "
+                                    "the server's range information. "
+                                    "Partial data has been preserved."
+                                )
+
+                except YouTubeExtractorError:
+                    raise
+
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
                     raise YouTubeRequestError(
-                        "Media server returned HTTP 416 "
-                        "for an incomplete download."
+                        f"Media download connection failed: {exc}"
+                    ) from exc
+
+                if refresh_needed:
+                    if refreshes >= max_url_refreshes:
+                        raise YouTubeRestricted(
+                            "Media URL remained rejected after refresh."
+                        )
+
+                    refreshes += 1
+                    info = await self.extract(video_id, force=True)
+
+                    selected = next(
+                        (
+                            item for item in info.get("formats", [])
+                            if item.get("itag") == itag
+                        ),
+                        None,
                     )
 
-                if status in (403, 429, 500, 502, 503, 504):
-                    refreshes += 1
-
-                    if refreshes > max_url_refreshes:
-                        raise YouTubeRequestError(
-                            f"Media server repeatedly rejected "
-                            f"the request (HTTP {status}). "
-                            "A PO Token, matching client, or "
-                            "different media access method may "
-                            "be required."
-                        )
-
-                    # Try another client before repeating the same one.
-                    if status == 403:
-                        client_index = (
-                            client_index + 1
-                        ) % len(client_names)
-
-                        next_client = client_names[
-                            client_index
-                        ]
-
-                        try:
-                            current_format = await self._fresh_format(
-                                video_id,
-                                itag,
-                                options,
-                                client_name=next_client,
-                            )
-                        except YouTubeExtractorError:
-                            current_format = await self._fresh_format(
-                                video_id,
-                                itag,
-                                options,
-                            )
-
-                    else:
-                        delay = min(
-                            0.5 * (2 ** min(refreshes, 4)),
-                            8.0,
-                        )
-
-                        await asyncio.sleep(delay)
-
-                        current_format = await self._fresh_format(
-                            video_id,
-                            itag,
-                            options,
-                            client_name=current_format.get(
-                                "client_name"
-                            ),
+                    if not selected or not selected.get("url"):
+                        raise YouTubeUnavailable(
+                            "A refreshed direct URL is unavailable."
                         )
 
                     continue
 
-                if status == 200:
-                    if downloaded:
-                        # Server ignored Range. Never append a full body
-                        # to an existing partial file.
-                        await asyncio.to_thread(
-                            temporary.unlink,
-                            missing_ok=True,
-                        )
+                break
 
-                        downloaded = 0
-
-                    body = result["data"]
-
-                    if not body:
-                        raise YouTubeRequestError(
-                            "YouTube returned an empty media response."
-                        )
-
-                    expected_total = len(body)
-
-                    await asyncio.to_thread(
-                        temporary.write_bytes,
-                        body,
-                    )
-
-                    downloaded = len(body)
-
-                    await asyncio.to_thread(
-                        self._write_resume_metadata,
-                        metadata_file,
-                        video_id,
-                        itag,
-                        expected_total,
-                    )
-
-                    break
-
-                if status != 206:
-                    raise YouTubeRequestError(
-                        f"Unexpected media HTTP status: {status}."
-                    )
-
-                body = result["data"]
-                response_total = result.get("total")
-
-                if response_total is not None:
-                    if (
-                        expected_total is not None
-                        and expected_total != response_total
-                    ):
-                        raise YouTubeRequestError(
-                            "Media size changed during download."
-                        )
-
-                    expected_total = response_total
-
-                    await asyncio.to_thread(
-                        self._write_resume_metadata,
-                        metadata_file,
-                        video_id,
-                        itag,
-                        expected_total,
-                    )
-
-                if not body:
-                    raise YouTubeRequestError(
-                        "YouTube returned an empty media chunk."
-                    )
-
-                await asyncio.to_thread(
-                    self._append_bytes,
-                    temporary,
-                    body,
-                )
-
-                downloaded += len(body)
-
-                if (
-                    expected_total is not None
-                    and downloaded > expected_total
-                ):
-                    raise YouTubeRequestError(
-                        "Downloaded data exceeds expected size."
-                    )
-
-                if (
-                    expected_total is not None
-                    and downloaded == expected_total
-                ):
-                    break
-
-            if not temporary.is_file():
+            if expected_size is not None and downloaded != expected_size:
                 raise YouTubeRequestError(
-                    "Temporary download file was not created."
+                    "Final download size verification failed. "
+                    "The partial file has been preserved."
                 )
 
-            actual_size = await asyncio.to_thread(
-                lambda: temporary.stat().st_size
-            )
-
-            if expected_total is None:
-                raise YouTubeRequestError(
-                    "Unable to verify the complete media size."
-                )
-
-            if actual_size != expected_total:
-                raise YouTubeRequestError(
-                    f"Incomplete download: "
-                    f"{actual_size}/{expected_total} bytes."
-                )
-
-            await asyncio.to_thread(
-                temporary.replace,
-                target,
-            )
-
-            await asyncio.to_thread(
-                metadata_file.unlink,
-                missing_ok=True,
-            )
+            part_path.replace(output_path)
 
             return {
                 "id": video_id,
                 "itag": itag,
-                "format_id": str(itag),
-                "path": str(target),
-                "size": actual_size,
-                "mime_type": current_format.get(
-                    "mime_type"
-                ),
-                "ext": current_format.get("ext"),
-                "bitrate": current_format.get("bitrate"),
-                "client_name": current_format.get(
-                    "client_name"
-                ),
-                "success": True,
+                "path": str(output_path),
+                "size": downloaded,
+                "format": selected,
+                "resumed": bool(resume),
+                "url_refreshes": refreshes,
             }
 
-        except YouTubeExtractorError:
-            raise
-
-        except (
-            httpx.TimeoutException,
-            httpx.TransportError,
-        ) as exc:
-            raise YouTubeRequestError(
-                f"Media network error: {type(exc).__name__}"
-            ) from exc
-
-        except OSError as exc:
-            raise YouTubeRequestError(
-                f"Unable to save media file: {exc}"
-            ) from exc
-
-    @staticmethod
-    def _append_bytes(path: Path, data: bytes):
-        with path.open("ab") as file:
-            file.write(data)
-
-    @staticmethod
-    def _extract_json_assignment(page, variable):
-        if not isinstance(page, str):
-            return None
-
-        pattern = re.compile(
-            rf"(?:var\s+|let\s+|const\s+)?"
-            rf"{re.escape(variable)}\s*="
-        )
-
-        match = pattern.search(page)
-
-        if not match:
-            return None
-
-        start = page.find("{", match.end())
-
-        if start < 0:
-            return None
-
-        depth = 0
-        in_string = False
-        escaped = False
-
-        for index in range(start, len(page)):
-            char = page[index]
-
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
-
-                continue
-
-            if char == '"':
-                in_string = True
-
-            elif char == "{":
-                depth += 1
-
-            elif char == "}":
-                depth -= 1
-
-                if depth == 0:
-                    try:
-                        return json.loads(
-                            page[start:index + 1]
-                        )
-                    except ValueError:
-                        return None
-
-        return None
-
-    @staticmethod
-    def _playlist_items(data):
-        output = []
-        seen = set()
-
-        for node in YouTubeExtractor._walk(data):
-            renderer = (
-                node.get("playlistVideoRenderer")
-                or node.get("playlistPanelVideoRenderer")
-            )
-
-            if not isinstance(renderer, dict):
-                continue
-
-            video_id = renderer.get("videoId")
-
-            if (
-                not isinstance(video_id, str)
-                or not _ID_RE.fullmatch(video_id)
-                or video_id in seen
-            ):
-                continue
-
-            seen.add(video_id)
-
-            output.append({
-                "id": video_id,
-                "title": YouTubeExtractor._text(
-                    renderer.get("title")
-                ),
-                "url": f"{_BASE}/watch?v={video_id}",
-                "thumbnail": YouTubeExtractor._thumbnails(
-                    (
-                        renderer.get("thumbnail") or {}
-                    ).get("thumbnails")
-                ),
-                "duration": YouTubeExtractor._text(
-                    renderer.get("lengthText")
-                ),
-                "index": YouTubeExtractor._text(
-                    renderer.get("index")
-                ),
-                "is_playable": renderer.get("isPlayable"),
-                "short_byline": YouTubeExtractor._text(
-                    renderer.get("shortBylineText")
-                ),
-            })
-
-        return output
-
-    @staticmethod
-    def _continuation(data):
-        # Prefer playlist continuation items instead of blindly
-        # selecting an arbitrary continuation endpoint.
-        for node in YouTubeExtractor._walk(data):
-            item = node.get("continuationItemRenderer")
-
-            if not isinstance(item, dict):
-                continue
-
-            endpoint = item.get(
-                "continuationEndpoint"
-            ) or {}
-
-            command = endpoint.get(
-                "continuationCommand"
-            ) or {}
-
-            token = command.get("token")
-
-            if isinstance(token, str) and token:
-                return token
-
-        return None
-
-    @staticmethod
-    def _playlist_metadata(data):
-        for node in YouTubeExtractor._walk(data):
-            renderer = node.get(
-                "playlistMetadataRenderer"
-            )
-
-            if isinstance(renderer, dict):
-                return {
-                    "title": renderer.get("title"),
-                    "description": renderer.get(
-                        "description"
-                    ),
-                }
-
-        return {
-            "title": None,
-            "description": None,
-        }
-
-    async def _browse_continuation(
-        self,
-        continuation,
-        options,
-    ):
-        await self._bootstrap()
-
-        payload = {
-            "context": {
-                "client": {
-                    "clientName": "WEB",
-                    "clientVersion": self._client_version,
-                    "hl": "en",
-                    "gl": "US",
-                }
-            },
-            "continuation": continuation,
-        }
-
-        response = await self._request(
-            "POST",
-            f"{_BASE}/youtubei/v1/browse",
-            options=options,
-            params={
-                "key": self._api_key,
-            },
-            json=payload,
-            headers={
-                "User-Agent": _WEB_UA,
-                "Content-Type": "application/json",
-                "Origin": _BASE,
-                "Referer": f"{_BASE}/",
-            },
-        )
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise YouTubeRequestError(
-                "Invalid playlist continuation response."
-            ) from exc
-        finally:
-            await response.aclose()
-
-        if not isinstance(data, dict):
-            raise YouTubeRequestError(
-                "Unexpected playlist continuation response."
-            )
-
-        return data
-
-    async def get_playlist(
-        self,
-        playlist_id: str,
-        *,
-        limit: int = 100,
-        flat: bool = True,
-        options: YouTubeOptions | None = None,
-        refresh: bool = False,
-    ):
-        options = options or YouTubeOptions()
-
-        if (
-            not isinstance(playlist_id, str)
-            or not _PLAYLIST_RE.fullmatch(playlist_id)
-        ):
-            raise YouTubeExtractorError(
-                "Invalid YouTube playlist ID."
-            )
-
-        try:
-            limit = max(
-                1,
-                min(
-                    int(limit),
-                    options.playlist_limit,
-                    500,
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            raise YouTubeExtractorError(
-                "Invalid playlist limit."
-            ) from exc
-
-        cache_key = (
-            f"playlist:{playlist_id}:{limit}:{bool(flat)}"
-        )
-
-        async def fetch():
-            response = await self._request(
-                "GET",
-                f"{_BASE}/playlist",
-                options=options,
-                params={
-                    "list": playlist_id,
-                },
-                headers={
-                    "User-Agent": _WEB_UA,
-                },
-            )
-
-            try:
-                data = self._extract_json_assignment(
-                    response.text,
-                    "ytInitialData",
-                )
-            finally:
-                await response.aclose()
-
-            if not isinstance(data, dict):
-                raise YouTubeRequestError(
-                    "Could not parse YouTube playlist page."
-                )
-
-            metadata = self._playlist_metadata(data)
-
-            items = self._playlist_items(data)
-            token = self._continuation(data)
-
-            seen = {
-                item["id"]
-                for item in items
-            }
-
-            pages = 0
-
-            while (
-                token
-                and len(items) < limit
-                and pages < 30
-            ):
-                pages += 1
-                current_token = token
-
-                next_data = await self._browse_continuation(
-                    current_token,
-                    options,
-                )
-
-                next_items = self._playlist_items(
-                    next_data
-                )
-
-                for item in next_items:
-                    if item["id"] in seen:
-                        continue
-
-                    items.append(item)
-                    seen.add(item["id"])
-
-                    if len(items) >= limit:
-                        break
-
-                # Do not lose the next page token just because
-                # the requested item limit was reached.
-                token = self._continuation(next_data)
-
-                if not next_items:
-                    break
-
-            return {
-                "id": playlist_id,
-                "title": metadata["title"],
-                "description": metadata["description"],
-                "url": (
-                    f"{_BASE}/playlist?list={playlist_id}"
-                ),
-                "video_count": None,
-                "items": items[:limit],
-                "continuation": token,
-                "has_more": bool(token),
-                "flat": bool(flat),
-            }
-
-        if refresh:
-            result = await fetch()
-
-            await self.playlist_cache.put(
-                cache_key,
-                result,
-            )
-
-            return self._copy_result(result)
-
-        result = await self.playlist_cache.get_or_create(
-            cache_key,
-            fetch,
-        )
-
-        return self._copy_result(result)
-
-    async def get_playlist_next(
-        self,
-        playlist_id: str,
-        continuation: str,
-        *,
-        limit: int = 100,
-        options: YouTubeOptions | None = None,
-    ):
-        options = options or YouTubeOptions()
-
-        if (
-            not isinstance(playlist_id, str)
-            or not _PLAYLIST_RE.fullmatch(playlist_id)
-        ):
-            raise YouTubeExtractorError(
-                "Invalid YouTube playlist ID."
-            )
-
-        if (
-            not isinstance(continuation, str)
-            or not continuation
-        ):
-            raise YouTubeExtractorError(
-                "A valid continuation token is required."
-            )
-
-        try:
-            limit = max(
-                1,
-                min(
-                    int(limit),
-                    options.playlist_limit,
-                    500,
-                ),
-            )
-        except (TypeError, ValueError) as exc:
-            raise YouTubeExtractorError(
-                "Invalid playlist limit."
-            ) from exc
-
-        data = await self._browse_continuation(
-            continuation,
-            options,
-        )
-
-        items = self._playlist_items(data)
-        next_token = self._continuation(data)
-
-        return {
-            "id": playlist_id,
-            "items": items[:limit],
-            "continuation": next_token,
-            "has_more": bool(next_token),
-        }
-
-    async def cache_stats(self):
+    async def cache_stats(self) -> dict[str, Any]:
         return {
             "metadata": await self.metadata_cache.stats(),
             "playlists": await self.playlist_cache.stats(),
             "streams": await self.stream_cache.stats(),
         }
 
-    async def clear_cache(self):
+    async def clear_cache(self) -> None:
         await asyncio.gather(
             self.metadata_cache.clear(),
             self.playlist_cache.clear(),
             self.stream_cache.clear(),
         )
-
-
-__all__ = [
-    "YouTubeExtractor",
-    "YouTubeExtractorError",
-    "YouTubeUnavailable",
-    "YouTubeRestricted",
-    "YouTubeRequestError",
-    "YouTubeOptions",
-    "TTLCache",
-]
