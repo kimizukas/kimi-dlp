@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import asyncio
@@ -13,6 +12,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+import hashlib
 
 import httpx
 
@@ -580,13 +580,56 @@ class YouTubeExtractor:
             "contentCheckOk": True,
             "racyCheckOk": True,
             "context": {"client": client},
-        }
+ 
+             }
+             
+             
+    def _sapisid_authorization(self) -> str | None:
+        """Build YouTube SAPISIDHASH authorization from loaded cookies."""
+
+        cookie_names = (
+            ("SAPISID", "SAPISIDHASH"),
+            ("__Secure-1PAPISID", "SAPISID1PHASH"),
+            ("__Secure-3PAPISID", "SAPISID3PHASH"),
+        )
+
+        jar = self.client.cookies.jar
+
+        wanted_names = {name for name, _ in cookie_names}
+        cookie_values = {}
+
+        for cookie in jar:
+            domain = (cookie.domain or "").lstrip(".").lower()
+
+            if domain == "youtube.com" or domain.endswith(".youtube.com"):
+                if cookie.name in wanted_names:
+                    cookie_values[cookie.name] = cookie.value
+
+        timestamp = str(int(time.time()))
+        hashes = []
+
+        for cookie_name, hash_name in cookie_names:
+            value = cookie_values.get(cookie_name)
+
+            if not value:
+                continue
+
+            digest = hashlib.sha1(
+                f"{timestamp} {value} {_BASE}".encode("utf-8")
+            ).hexdigest()
+
+            hashes.append(
+                f"{hash_name} {timestamp}_{digest}"
+            )
+
+        return " ".join(hashes) or None
 
     async def _player_request(
         self,
         video_id: str,
         config: dict[str, Any],
     ) -> dict[str, Any]:
+
         payload = self._player_payload(
             video_id,
             config["name"],
@@ -594,19 +637,26 @@ class YouTubeExtractor:
             self.po_token,
         )
 
+        headers = {
+            "User-Agent": config["user_agent"],
+            "Content-Type": "application/json",
+            "Origin": _BASE,
+            "Referer": f"{_BASE}/",
+            "X-YouTube-Client-Name": config["client_id"],
+            "X-YouTube-Client-Version": config["version"],
+        }
+
+        authorization = self._sapisid_authorization()
+
+        if authorization:
+            headers["Authorization"] = authorization
+
         response = await self._request(
             "POST",
             _PLAYER_URL,
             params={"key": self._api_key},
             json=payload,
-            headers={
-                "User-Agent": config["user_agent"],
-                "Content-Type": "application/json",
-                "Origin": _BASE,
-                "Referer": f"{_BASE}/",
-                "X-YouTube-Client-Name": config["client_id"],
-                "X-YouTube-Client-Version": config["version"],
-            },
+            headers=headers,
         )
 
         try:
@@ -626,7 +676,10 @@ class YouTubeExtractor:
 
         data["_extractor_client"] = config["name"]
         data["_extractor_user_agent"] = config["user_agent"]
+
         return data
+
+
 
     @staticmethod
     def _player_status(data: dict[str, Any]) -> str | None:
@@ -1636,7 +1689,7 @@ class YouTubeExtractor:
         await self.playlist_cache.put(cache_key, result)
         return result
 
-    
+
 
     async def download_format(
         self,
@@ -2003,7 +2056,7 @@ class YouTubeExtractor:
                 "resumed": initial_downloaded > 0,
                 "url_refreshes": refreshes,
             }
-                
+
 
     async def cache_stats(self) -> dict[str, Any]:
         return {
