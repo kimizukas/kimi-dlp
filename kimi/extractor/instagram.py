@@ -15,8 +15,6 @@ import httpx
 
 
 
-
-
 _BASE_URL = "https://www.instagram.com"
 _ALLOWED_PAGE_HOSTS = {"instagram.com", "www.instagram.com"}
 _ALLOWED_MEDIA_SUFFIXES = (
