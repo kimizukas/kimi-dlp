@@ -12,14 +12,18 @@ from urllib.parse import urlparse, urlunparse
 
 import httpx
 
+from ..cookies import CookieStore
+from ..network import RETRYABLE_STATUS_CODES, RetryPolicy
+from .share import ShareResolver, ShareResolverError
+
 
 _BASE_URL = "https://www.instagram.com"
 _ALLOWED_PAGE_HOSTS = {
     "instagram.com", "www.instagram.com", "m.instagram.com",
-    "instagr.am", "www.instagr.am",
+    "applink.instagram.com", "instagr.am", "www.instagr.am",
 }
 _ALLOWED_MEDIA_SUFFIXES = ("cdninstagram.com", "fbcdn.net", "instagram.com")
-_TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+_TRANSIENT_STATUSES = RETRYABLE_STATUS_CODES
 _SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 _PUBLIC_APP_ID = "936619743392459"
 _LOGGED_OUT_DOC_ID = "27130156389949648"
@@ -27,11 +31,11 @@ _LOGGED_OUT_QUERY_NAME = "PolarisLoggedOutDesktopWWWPostRootContentQuery"
 
 _SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,32}$")
 _URL_RE = re.compile(
-    r"https?://(?:(?:www|m)\.)?instagram\.com/"
+    r"https?://(?:(?:www|m|applink)\.)?instagram\.com/"
     r"(?:"
     r"(?:p|reel|reels|tv)/[A-Za-z0-9_-]+"
     r"|[^/?#]+/(?:p|reel|reels|tv)/[A-Za-z0-9_-]+"
-    r"|share/(?:p/|reel/)?[A-Za-z0-9_-]+"
+    r"|share/(?:p/|reel/|reels/)?[A-Za-z0-9_-]+"
 
     r")"
     r"|https?://(?:www\.)?instagr\.am/[A-Za-z0-9_-]+",
@@ -139,8 +143,15 @@ def _normalise_post_url(value: str) -> tuple[str, str, str]:
     except ValueError as exc:
         raise InstagramInvalidURL("Invalid Instagram URL.") from exc
 
-    if parsed.scheme.lower() not in {"http", "https"}:
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
         raise InstagramInvalidURL("Only HTTP(S) Instagram URLs are supported.")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise InstagramInvalidURL("Invalid Instagram URL port.") from exc
+    if port not in (None, 443 if scheme == "https" else 80):
+        raise InstagramInvalidURL("Non-standard Instagram URL ports are not supported.")
     if parsed.username or parsed.password:
         raise InstagramInvalidURL("Credentials are not allowed in Instagram URLs.")
 
@@ -446,6 +457,7 @@ def _is_allowed_media_url(value: str) -> bool:
         host = (parsed.hostname or "").lower()
         return (
             parsed.scheme.lower() == "https"
+            and parsed.port in (None, 443)
             and not parsed.username
             and not parsed.password
             and any(host == suffix or host.endswith("." + suffix) for suffix in _ALLOWED_MEDIA_SUFFIXES)
@@ -457,8 +469,9 @@ def _is_allowed_media_url(value: str) -> bool:
 class InstagramExtractor:
     """Async extractor for accessible Instagram posts, Reels and carousels.
 
-    Pass an httpx.AsyncClient with your own cookies to use an existing session.
-    This class does not log in or bypass private-account restrictions.
+    Pass ``cookies`` or ``cookie_file`` to reuse a Netscape/httpx session, or
+    pass an existing ``httpx.AsyncClient``. This class does not log in or bypass
+    private-account restrictions.
     """
 
     def __init__(
@@ -469,9 +482,22 @@ class InstagramExtractor:
         proxy: str | None = None,
         client: httpx.AsyncClient | None = None,
         options: InstagramOptions | None = None,
+        cookies: Any = None,
+        cookie_file: str | Path | None = None,
     ) -> None:
         self.options = options or InstagramOptions(timeout=timeout, retries=retries)
         self._external_client = client is not None
+        self.cookie_store = CookieStore(
+            default_domain=".instagram.com", path=cookie_file
+        )
+        if cookie_file is not None:
+            cookie_path = Path(cookie_file).expanduser()
+            if cookie_path.exists() and not cookie_path.is_file():
+                raise ValueError(f"Cookie path is not a file: {cookie_path}")
+            if cookie_path.is_file():
+                self.cookie_store.load(cookie_path)
+        if cookies is not None:
+            self.cookie_store.load(cookies)
         self._closed = False
         if client is not None:
             self.client = client
@@ -485,6 +511,7 @@ class InstagramExtractor:
                     max_keepalive_connections=max(2, self.options.request_concurrency),
                     keepalive_expiry=30.0,
                 ),
+                cookies=self.cookie_store.cookies,
                 headers={
                     "User-Agent": (
                         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -494,6 +521,11 @@ class InstagramExtractor:
                     "Accept-Language": "en-US,en;q=0.9",
                 },
             )
+        self.cookie_store.bind(self.client.cookies)
+        self._share_resolver = ShareResolver(
+            client=self.client, timeout=self.options.timeout,
+            retries=self.options.retries,
+        )
         self._request_semaphore = asyncio.Semaphore(self.options.request_concurrency)
         self._download_semaphore = asyncio.Semaphore(self.options.download_concurrency)
         self._bootstrap_lock = asyncio.Lock()
@@ -510,8 +542,19 @@ class InstagramExtractor:
         if self._closed:
             return
         self._closed = True
-        if not self._external_client:
-            await self.client.aclose()
+        try:
+            if self.cookie_store.path is not None:
+                self.cookie_store.save()
+        finally:
+            if not self._external_client:
+                await self.client.aclose()
+
+    def save_cookies(self, path: str | Path | None = None) -> Path:
+        """Persist the active Instagram cookie jar in Netscape format."""
+        return self.cookie_store.save(path)
+
+    def cookie_stats(self) -> dict:
+        return self.cookie_store.stats()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -519,27 +562,13 @@ class InstagramExtractor:
 
     @staticmethod
     def _retry_delay(response: httpx.Response | None, attempt: int) -> float:
-        if response is not None:
-            retry_after = response.headers.get("Retry-After")
-            if retry_after:
-                try:
-                    return min(15.0, max(0.0, float(retry_after)))
-                except ValueError:
-                    pass
-        return min(0.5 * (2 ** attempt), 4.0)
+        return RetryPolicy(base_delay=0.5, max_delay=15.0, jitter=0.0).delay(
+            response, attempt
+        )
 
     def _cookie(self, name: str) -> str | None:
-        try:
-            value = self.client.cookies.get(name, domain="www.instagram.com")
-            if value:
-                return value
-        except (KeyError, httpx.CookieConflict):
-            pass
-        try:
-            value = self.client.cookies.get(name)
-            return value or None
-        except (KeyError, httpx.CookieConflict):
-            return None
+        value = self.cookie_store.get_for_url(name, _BASE_URL + "/")
+        return str(value) if value else None
 
     async def _request_page(self, url: str) -> httpx.Response:
         self._ensure_open()
@@ -589,41 +618,41 @@ class InstagramExtractor:
         raise InstagramRequestError("Unable to retrieve Instagram page.")
 
     async def _resolve_url(self, value: str) -> str:
-        """Resolve share/short links, then validate the final Instagram URL."""
+        """Resolve Instagram AppLinks/share links through the safe host allowlist."""
+        self._ensure_open()
         try:
-            parsed = urlparse(value.strip())
-        except (AttributeError, ValueError) as exc:
-            raise InstagramInvalidURL("Invalid Instagram URL.") from exc
-        if parsed.scheme.lower() not in {"http", "https"} or parsed.username or parsed.password:
-            raise InstagramInvalidURL("Only valid HTTP(S) Instagram URLs are supported.")
-        if (parsed.hostname or "").lower() not in _ALLOWED_PAGE_HOSTS:
-            raise InstagramInvalidURL("URL must belong to Instagram.")
+            return await self._share_resolver.resolve(value)
+        except ShareResolverError as exc:
+            message = str(exc)
+            if "logged-in session" in message.lower():
+                raise InstagramLoginRequired(message) from exc
+            raise InstagramInvalidURL(message) from exc
 
-        path = parsed.path.lower()
-        is_short = (parsed.hostname or "").lower().endswith("instagr.am")
-        is_share = path.startswith("/share/")
-        if not (is_short or is_share):
-            return value
-
-        response = await self._request_page(value)
-        try:
-            final_url = str(response.url)
-            final_host = (response.url.host or "").lower()
-            if final_host not in _ALLOWED_PAGE_HOSTS:
-                raise InstagramInvalidURL("Share link redirected outside Instagram.")
-            # Some deployments serve a share landing page without an HTTP redirect.
-            if final_url == value and (is_short or is_share):
-                canonical = response.headers.get("Link", "")
-                match = re.search(r'<([^>]+)>;\s*rel=["\']?canonical', canonical, re.I)
-                if match:
-                    final_url = match.group(1)
-                else:
-                    parser = _PageParser()
-                    parser.feed(response.text)
-                    final_url = parser.meta.get("og:url") or final_url
-            return final_url
-        finally:
-            await response.aclose()
+    async def _request_api(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """Retry transient Instagram API failures while keeping the caller's semaphore."""
+        for attempt in range(self.options.retries + 1):
+            response = None
+            try:
+                response = await self.client.request(method, url, **kwargs)
+                if response.status_code in _TRANSIENT_STATUSES and attempt < self.options.retries:
+                    delay = self._retry_delay(response, attempt)
+                    await response.aclose()
+                    response = None
+                    await asyncio.sleep(delay)
+                    continue
+                result = response
+                response = None
+                return result
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if attempt >= self.options.retries:
+                    raise InstagramRequestError(
+                        f"Instagram API request failed: {type(exc).__name__}."
+                    ) from exc
+                await asyncio.sleep(self._retry_delay(None, attempt))
+            finally:
+                if response is not None and not response.is_closed:
+                    await response.aclose()
+        raise InstagramRequestError("Instagram API request failed after retries.")
 
     async def _get_page(self, url: str) -> str:
         response = await self._request_page(url)
@@ -674,8 +703,8 @@ class InstagramExtractor:
         }
         async with self._request_semaphore:
             try:
-                access_response = await self.client.get(
-                    f"{_BASE_URL}/api/v1/web/get_ruling_for_content/",
+                access_response = await self._request_api(
+                    "GET", f"{_BASE_URL}/api/v1/web/get_ruling_for_content/",
                     params={"content_type": "MEDIA", "target_id": media_id},
                     headers=api_headers,
                 )
@@ -705,8 +734,8 @@ class InstagramExtractor:
                 if csrf:
                     headers["X-CSRFToken"] = csrf
 
-                response = await self.client.post(
-                    f"{_BASE_URL}/api/graphql", data=form, headers=headers
+                response = await self._request_api(
+                    "POST", f"{_BASE_URL}/api/graphql", data=form, headers=headers
                 )
                 try:
                     if response.status_code == 429:
@@ -718,6 +747,10 @@ class InstagramExtractor:
                     payload = response.json()
                 finally:
                     await response.aclose()
+            except InstagramRateLimited:
+                raise
+            except InstagramRequestError:
+                return None
             except InstagramExtractorError:
                 raise
             except (httpx.TimeoutException, httpx.TransportError, json.JSONDecodeError, ValueError):
@@ -962,83 +995,166 @@ class InstagramExtractor:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            for destination in destinations:
-                for path in (destination, destination.with_name(destination.name + ".part")):
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+            # Completed outputs and .part files are intentionally retained.
+            # A subsequent download() call can resume interrupted transfers.
             raise
         return destinations
 
     async def _download_one(self, url: str, destination: Path) -> None:
+        """Download a media URL with HTTP Range resume and bounded retries."""
         self._ensure_open()
+        if not _is_allowed_media_url(url):
+            raise InstagramExtractorError("Media URL is not on an allowed Instagram CDN host.")
+
         async with self._download_semaphore:
             temporary = destination.with_name(destination.name + ".part")
-            for attempt in range(self.options.retries + 1):
-                written = 0
+            attempts = 0
+            while True:
+                offset = temporary.stat().st_size if temporary.is_file() else 0
+                headers = {
+                    "Referer": _BASE_URL + "/",
+                    "Accept": "*/*",
+                    "Accept-Encoding": "identity",
+                }
+                if offset:
+                    headers["Range"] = f"bytes={offset}-"
+
                 try:
-                    async with self.client.stream(
-                        "GET", url,
-                        headers={
-                            "Referer": _BASE_URL + "/",
-                            "Accept": "*/*",
-                            "Accept-Encoding": "identity",
-                        },
-                    ) as response:
+                    async with self.client.stream("GET", url, headers=headers) as response:
                         status = response.status_code
                         if status in _TRANSIENT_STATUSES:
-                            if attempt < self.options.retries:
-                                delay = self._retry_delay(response, attempt)
-                                await asyncio.sleep(delay)
-                                continue
-                            if status == 429:
-                                raise InstagramRateLimited("Instagram CDN rate limit reached.")
-                            raise InstagramRequestError(f"Media download failed with HTTP {status}.")
+                            if attempts >= self.options.retries:
+                                if status == 429:
+                                    raise InstagramRateLimited("Instagram CDN rate limit reached.")
+                                raise InstagramRequestError(
+                                    f"Media download failed with HTTP {status}."
+                                )
+                            delay = self._retry_delay(response, attempts)
+                            attempts += 1
+                            await asyncio.sleep(delay)
+                            continue
                         if status in {401, 403, 404}:
-                            raise InstagramUnavailable(f"Media URL is unavailable (HTTP {status}).")
-                        if status >= 400:
-                            raise InstagramRequestError(f"Media download failed with HTTP {status}.")
+                            raise InstagramUnavailable(
+                                f"Media URL is unavailable (HTTP {status}); re-extract to refresh the URL."
+                            )
+                        if status not in {200, 206, 416}:
+                            raise InstagramRequestError(
+                                f"Media download failed with HTTP {status}."
+                            )
 
                         final_host = (response.url.host or "").lower()
-                        if not any(final_host == suffix or final_host.endswith("." + suffix) for suffix in _ALLOWED_MEDIA_SUFFIXES):
+                        if response.url.scheme != "https" or response.url.port not in (None, 443):
+                            raise InstagramRequestError("Media redirected to an insecure or non-standard URL.")
+                        if not any(
+                            final_host == suffix or final_host.endswith("." + suffix)
+                            for suffix in _ALLOWED_MEDIA_SUFFIXES
+                        ):
                             raise InstagramRequestError("Media redirected to an unsupported host.")
-                        length_header = response.headers.get("Content-Length")
-                        length = _number(length_header) if length_header is not None else None
-                        if length is not None and length > self.options.max_download_size:
+
+                        if status == 416:
+                            match = re.fullmatch(
+                                r"bytes\s+\*/(\d+)",
+                                response.headers.get("Content-Range", "").strip(), re.I,
+                            )
+                            total = int(match.group(1)) if match else None
+                            if offset and total is not None and offset == total:
+                                temporary.replace(destination)
+                                return
+                            if attempts >= self.options.retries:
+                                raise InstagramRequestError(
+                                    "The media server rejected the resume range (HTTP 416)."
+                                )
+                            temporary.unlink(missing_ok=True)
+                            attempts += 1
+                            continue
+
+                        content_range = response.headers.get("Content-Range")
+                        response_length_header = response.headers.get("Content-Length")
+                        response_length = _number(response_length_header) if response_length_header else None
+                        total_length = None
+                        expected_response_length = response_length
+                        write_mode = "wb"
+
+                        if status == 206:
+                            match = re.fullmatch(
+                                r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
+                                content_range or "", re.I,
+                            )
+                            if not match:
+                                raise InstagramRequestError("Invalid Content-Range from Instagram CDN.")
+                            range_start, range_end = int(match.group(1)), int(match.group(2))
+                            total_length = None if match.group(3) == "*" else int(match.group(3))
+                            if range_end < range_start or range_start != offset:
+                                raise InstagramRequestError("Instagram CDN returned an unexpected byte range.")
+                            if total_length is not None and (total_length <= range_end or total_length > self.options.max_download_size):
+                                raise InstagramRequestError("Invalid or oversized media length in Content-Range.")
+                            expected_response_length = range_end - range_start + 1
+                            write_mode = "ab" if offset else "wb"
+                        else:
+                            # A server that ignores Range returns 200. Start over
+                            # rather than append a complete file to a partial one.
+                            offset = 0
+                            write_mode = "wb"
+                            if response_length is not None:
+                                total_length = response_length
+
+                        if total_length is not None and total_length > self.options.max_download_size:
                             raise InstagramRequestError("Media exceeds configured maximum download size.")
 
-                        with temporary.open("wb") as file:
-                            async for chunk in response.aiter_bytes(self.options.chunk_size):
-                                if not chunk:
-                                    continue
-                                written += len(chunk)
-                                if written > self.options.max_download_size:
-                                    raise InstagramRequestError("Media exceeded maximum download size.")
-                                file.write(chunk)
+                        received = 0
+                        with temporary.open(write_mode) as file:
+                            # Accept-Encoding is identity; raw chunks preserve
+                            # every byte even if a transport closes mid-response.
+                            if response.is_stream_consumed:
+                                # MockTransport/pre-buffered responses expose
+                                # their bytes through .content instead of a live stream.
+                                body = response.content
+                                for start in range(0, len(body), self.options.chunk_size):
+                                    chunk = body[start:start + self.options.chunk_size]
+                                    received += len(chunk)
+                                    if received > self.options.max_download_size:
+                                        raise InstagramRequestError("Media exceeded maximum download size.")
+                                    file.write(chunk)
+                            else:
+                                async for chunk in response.aiter_raw():
+                                    if not chunk:
+                                        continue
+                                    received += len(chunk)
+                                    if received > self.options.max_download_size:
+                                        raise InstagramRequestError("Media exceeded maximum download size.")
+                                    file.write(chunk)
+                            file.flush()
 
-                        if written == 0:
-                            raise InstagramRequestError("Instagram returned an empty media file.")
-                        if length is not None and written != length:
+                        if expected_response_length is not None and received != expected_response_length:
                             raise InstagramRequestError(
-                                f"Incomplete media response: expected {length}, received {written} bytes."
+                                f"Incomplete media response: expected {expected_response_length}, received {received} bytes."
                             )
-                    temporary.replace(destination)
-                    return
+
+                    actual = temporary.stat().st_size if temporary.is_file() else 0
+                    if actual == 0:
+                        raise InstagramRequestError("Instagram returned an empty media file.")
+                    if actual > self.options.max_download_size:
+                        raise InstagramRequestError("Media exceeded maximum download size.")
+                    if total_length is None or actual == total_length:
+                        temporary.replace(destination)
+                        return
+                    if actual < total_length:
+                        # Some CDNs cap one range response. Continue from the
+                        # exact byte offset without consuming the retry budget.
+                        continue
+                    raise InstagramRequestError("Downloaded media is larger than its declared size.")
+
                 except InstagramExtractorError:
                     raise
                 except (httpx.TimeoutException, httpx.TransportError) as exc:
-                    if attempt >= self.options.retries:
+                    if attempts >= self.options.retries:
                         raise InstagramRequestError(
                             f"Media download failed: {type(exc).__name__}: {exc}"
                         ) from exc
-                    await asyncio.sleep(self._retry_delay(None, attempt))
-                finally:
-                    try:
-                        temporary.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            raise InstagramRequestError("Media download failed after retries.")
+                    await asyncio.sleep(self._retry_delay(None, attempts))
+                    attempts += 1
+                except OSError as exc:
+                    raise InstagramRequestError(f"Unable to write media file: {exc}") from exc
 
 
 def extract_instagram_urls(text: str) -> list[str]:

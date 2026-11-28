@@ -1,7 +1,3 @@
+from .youtube_search import YouTubeSearch, YouTubeSearchError, detect_filter
 
-from .youtube_search import YouTubeSearch, YouTubeSearchError
-
-__all__ = [
-    "YouTubeSearch",
-    "YouTubeSearchError",
-]
+__all__ = ["YouTubeSearch", "YouTubeSearchError", "detect_filter"]
